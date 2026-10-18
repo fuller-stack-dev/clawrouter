@@ -3,8 +3,6 @@ import assert from "node:assert/strict";
 import { sqlBudgetNamespace } from "./sql-budget-namespace.mjs";
 import { proxyKey, sse, usageEnv } from "./usage-budget-fixture.mjs";
 import test from "node:test";
-
-
 const { default: handler } = await import("../index.ts");
 const { providerBudgetStatus, queue } = await import("../ledgers.ts");
 
@@ -46,7 +44,12 @@ test("GET /v1/usage preserves the budget response contract while selecting the c
   assert.equal(response.status, 200);
   const body = await response.json();
   const month = new Date().toISOString().slice(0, 7);
-  assert.deepEqual(body.budget, {
+  assert.equal(body.budget.daily.configured, false);
+  assert.ok(body.budget.daily.resetsAt.endsWith("T00:00:00.000Z"));
+  assert.equal(body.budget.weekly.configured, false);
+  const { daily, weekly, resetsAt, ...monthly } = body.budget;
+  assert.ok(resetsAt.endsWith("T00:00:00.000Z"));
+  assert.deepEqual(monthly, {
     configured: true,
     ledger: "durable_object",
     windowKey: `tenant/maintainer_access/owner@example.com/${month}`,
@@ -54,10 +57,9 @@ test("GET /v1/usage preserves the budget response contract while selecting the c
     spentMicros: 10,
     remainingMicros: 90,
   });
-  assert.deepEqual(Object.keys(body.budget), ["configured", "ledger", "windowKey", "limitMicros", "spentMicros", "remainingMicros"]);
+  assert.deepEqual(Object.keys(body.budget), ["configured", "ledger", "windowKey", "limitMicros", "spentMicros", "remainingMicros", "resetsAt", "daily", "weekly"]);
   assert.equal(objectNames[0], "tenant:maintainer_access:owner@example.com");
 });
-
 test("failed dispatch confirmation never reaches upstream and releases both real budgets", async (t) => {
   for (const failedOwner of ["tenant:maintainer_access:owner@example.com", "provider:openai"]) {
     const env = usageEnv([], { limit: 1_000_000, fixedCost: null, retainContent: false });
@@ -299,8 +301,8 @@ for (const [name, route, requestedTier, payload, contentType, expected, servedTi
   ["syntax after late usage remains estimated", "/v1/responses", "priority", JSON.stringify({ output: largeResponsesOutput, service_tier: "priority", usage: astraUsage }) + "!", "application/json", null, null, "provider_error"],
   ["native fast alias", "/v1/native/openai/v1/responses", "fast", { service_tier: "fast", usage: astraUsage }, "application/json", 1_080, "fast"],
   ["JSON Flex", "/v1/responses", "flex", { service_tier: "flex", usage: astraUsage }, "application/json", 270, "flex"],
-  ["omitted inherits Fast", "/v1/responses", undefined, { service_tier: "priority", usage: astraUsage }, "application/json", 1_080, "priority"],
-  ["auto inherits Fast", "/v1/responses", "auto", { service_tier: "priority", usage: astraUsage }, "application/json", 1_080, "priority"],
+  ["omitted pins Default", "/v1/responses", undefined, { service_tier: "default", usage: astraUsage }, "application/json", 540, "default"],
+  ["auto pins Default", "/v1/responses", "auto", { service_tier: "default", usage: astraUsage }, "application/json", 540, "default"],
   ["Responses SSE downgrade", "/v1/responses", "priority", sse({ type: "response.created", response: { service_tier: "priority" } }, { type: "response.completed", response: { service_tier: "default", usage: astraUsage } }), "text/event-stream", 540, "default"],
   ["Responses SSE max-output incomplete", "/v1/responses", "priority", sse({ type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, service_tier: "priority", usage: astraUsage } }), "text/event-stream", 1_080, "priority"],
   ["Responses SSE failed with usage", "/v1/responses", "priority", sse({ type: "response.failed", response: { status: "failed", service_tier: "priority", usage: astraUsage } }), "text/event-stream", 1_080, "priority", "provider_error"],
@@ -320,7 +322,7 @@ for (const [name, route, requestedTier, payload, contentType, expected, servedTi
     env.USAGE_QUEUE = { send: async (event) => { events.push(event); } };
     const upstreamBody = typeof payload === "string" ? payload : JSON.stringify(payload);
     t.mock.method(globalThis, "fetch", async (_url, init) => {
-      assert.equal(JSON.parse(init.body).service_tier, requestedTier);
+      assert.equal(JSON.parse(init.body).service_tier, requestedTier == null || requestedTier === "auto" ? "default" : requestedTier);
       return new Response(upstreamBody, { headers: { "content-type": contentType } });
     });
     const response = await handler.fetch(new Request(`https://clawrouter.example${route}`, {
@@ -338,7 +340,7 @@ for (const [name, route, requestedTier, payload, contentType, expected, servedTi
     assert.equal(event.actual_cost_micros, charged);
     assert.equal(event.status, outcome);
     assert.equal(event.status_code, 200);
-    assert.equal(event.requested_service_tier, requestedTier ?? null);
+    assert.equal(event.requested_service_tier, requestedTier == null || requestedTier === "auto" ? "default" : requestedTier);
     assert.equal(event.served_service_tier, servedTier);
     assert.equal(event.cost_basis, fixedCost != null ? "policy_fixed" : expected == null ? "manifest_reservation" : "manifest_pricing");
     assert.equal(event.content_retained, false);
@@ -575,7 +577,7 @@ test("settlement bases distinguish nonbillable work from tariffs, fallback charg
 test("either enforced budget rejects unsupported tiers while fixed policy tariffs remain explicit", async (t) => {
   for (const [limit, providerLimit, fixedCost] of [[1_000_000, null, null], [null, 1_000_000, null], [1_000_000, 1_000_000, null], [1_000_000, 1_000_000, 7]]) {
     const events = [], pending = [];
-    const env = usageEnv([], { limit, providerLimit, fixedCost, retainContent: false });
+    const env = usageEnv([], { limit, providerLimit, fixedCost, retainContent: false, serviceTiers: { allowed: ["default", "future"] } });
     env.OPENAI_API_KEY = "fixture-openai-key";
     env.BUDGET_LEDGER = sqlBudgetNamespace(t);
     env.USAGE_QUEUE = { send: async event => { events.push(event); } };
@@ -597,10 +599,10 @@ test("either enforced budget rejects unsupported tiers while fixed policy tariff
 });
 
 for (const existingUnmetered of [false, true]) {
-  test(`${existingUnmetered ? "existing stored" : "fresh"} unmetered policies forward unknown tiers and distinguish unavailable prices`, async (t) => {
+  test(`${existingUnmetered ? "existing stored" : "fresh"} unmetered policies explicitly allowing a future tier distinguish unavailable prices`, async (t) => {
     for (const [servedTier, status, expected, basis] of [["future", 200, 0, "unpriced_usage"], [undefined, 200, 0, "unpriced_usage"], ["priority", 200, 1_080, "manifest_pricing"], ["default", 200, 540, "manifest_pricing"], ["future", 400, 0, "none"], ["transport_failure", 502, 0, "unpriced_usage"], ["timeout", 502, 0, "unpriced_usage"], ["retention_failure", 503, 0, "none"]]) {
       const events = [], pending = [], ledgerCalls = [];
-      const env = usageEnv(ledgerCalls, { limit: null, providerLimit: null, fixedCost: null, retainContent: servedTier === "retention_failure", existingUnmetered });
+      const env = usageEnv(ledgerCalls, { limit: null, providerLimit: null, fixedCost: null, retainContent: servedTier === "retention_failure", existingUnmetered, serviceTiers: { allowed: ["default", "future"] } });
       env.OPENAI_API_KEY = "fixture-openai-key";
       env.USAGE_QUEUE = { send: async event => events.push(event) };
       env.CONTENT_ARCHIVE = { put: async () => { throw new Error("synthetic retention failure"); } };
@@ -976,4 +978,19 @@ test("DeepSeek invalid limits reserve the full bound before either budget, while
     else assert.equal(events[0].reserved_output_tokens, 393_216);
     upstream.mock.restore();
   }
+});
+
+for (const existingUnmetered of [false, true]) test(`default tier policy blocks unknown and ultrafast before upstream (${existingUnmetered})`, async t => {
+  const env = usageEnv([], { limit: null, providerLimit: null, fixedCost: null, retainContent: false, existingUnmetered });
+  env.OPENAI_API_KEY = "fixture-openai-key";
+  const upstream = t.mock.method(globalThis, "fetch", async () => { throw new Error("denied tiers must not dispatch"); });
+  const pending = [];
+  env.USAGE_QUEUE = { send: async () => {} };
+  for (const service_tier of ["future", "ultrafast"]) {
+    const response = await handler.fetch(new Request("https://clawrouter.example/v1/responses", { method: "POST", headers: { authorization: `Bearer ${proxyKey()}`, "content-type": "application/json" }, body: JSON.stringify({ model: "openai/gpt-6-astra", input: "synthetic", service_tier }) }), env, { waitUntil: task => pending.push(task) });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.code, "service_tier_not_allowed");
+  }
+  await Promise.all(pending);
+  assert.equal(upstream.mock.callCount(), 0);
 });

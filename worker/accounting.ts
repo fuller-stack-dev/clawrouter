@@ -1,5 +1,6 @@
+import { dailyBudgetMessage, weeklyBudgetMessage, withLimitHint } from "./policy-limits.ts";
 import type { AuthorizedIdentity, BudgetReserveRequest, BudgetSettleRequest, Env, ProviderConnection, UsageEvent } from "./types";
-import { budgetLedgerAddress, budgetPrincipal, providerBudgetLedgerAddress } from "./budget-scope.ts";
+import { budgetLedgerAddress, dailyBudgetLedgerAddress, weeklyBudgetLedgerAddress, budgetPrincipal, providerBudgetLedgerAddress } from "./budget-scope.ts";
 import { logCorrelationError } from "./correlation.ts";
 import { ingestUsage, settleLedger } from "./ledgers.ts";
 import { HttpError, randomId } from "./utils.ts";
@@ -16,7 +17,8 @@ interface LedgerBudgetReservation {
 }
 
 export interface BudgetReservationIntent {
-  kind: "policy" | "provider";
+  kind: "policy" | "daily" | "weekly" | "provider";
+  limitHint?: string | null;
   objectName: string;
   request: BudgetReserveRequest;
 }
@@ -35,13 +37,15 @@ export interface EstimatedCost {
 
 // Shared with read-only availability. Passing this guard never replaces the
 // atomic reservation; the return value only says whether a ledger is required.
-export function validateBudgetReservation(capability: string, cost: EstimatedCost, policyLimit: number | null | undefined, connection?: ProviderConnection): boolean {
+export function validateBudgetReservation(capability: string, cost: EstimatedCost, policyLimit: number | null | undefined, connection?: ProviderConnection, dailyLimit?: number | null, limitHint?: string | null, weeklyLimit?: number | null): boolean {
+  if (dailyLimit === 0) throw new HttpError(402, "daily_budget_exhausted", withLimitHint(dailyBudgetMessage(0), { limitHint }));
+  if (weeklyLimit === 0) throw new HttpError(402, "weekly_budget_exhausted", withLimitHint(weeklyBudgetMessage(0), { limitHint }));
   if (capability === "llm.count_tokens") return false;
   const providerLimit = connection?.monthlyBudgetMicros;
   // Unmetered callers retain upstream tier selection; only an enforced budget
   // needs a provable reservation price before dispatch.
-  if (policyLimit == null && providerLimit == null) return false;
-  if (policyLimit === 0) throw new HttpError(402, "budget_exhausted", "proxy key budget is exhausted");
+  if (policyLimit == null && providerLimit == null && dailyLimit == null && weeklyLimit == null) return false;
+  if (policyLimit === 0) throw new HttpError(402, "budget_exhausted", withLimitHint("proxy key budget is exhausted", { limitHint }));
   if (providerLimit === 0) throw new HttpError(402, "provider_budget_exhausted", `provider ${connection?.providerId ?? "unknown"} monthly budget is exhausted`);
   if (cost.basis === "unpriced_service_tier") throw new HttpError(400, "pricing_required", "requested service tier has no versioned manifest price; select a declared tier or configure a fixed policy request price");
   if (cost.pricingGap === "retained_tool_unknown") throw new HttpError(400, "pricing_required", "retained response tools have no qualified bounded price; start a token-priced request without previous_response_id or configure a fixed policy request price");
@@ -53,18 +57,20 @@ export function validateBudgetReservation(capability: string, cost: EstimatedCos
 // Construct before I/O so a durable caller can record the exact IDs, scopes and
 // month before an acknowledgment is lost. Physical shard aliases remain two legs.
 export function planBudgetReservation(auth: AuthorizedIdentity, capability: string, cost: EstimatedCost, connection?: ProviderConnection, at = Date.now()): BudgetReservationPlan {
-  if (!validateBudgetReservation(capability, cost, auth.policy.monthlyBudgetMicros, connection)) return { reservedMicros: 0, legs: [] };
+  if (!validateBudgetReservation(capability, cost, auth.policy.monthlyBudgetMicros, connection, auth.policy.dailyBudgetMicros, auth.policy.limitHint, auth.policy.weeklyBudgetMicros)) return { reservedMicros: 0, legs: [] };
   const policyLimit = auth.policy.monthlyBudgetMicros;
   const providerLimit = connection?.monthlyBudgetMicros;
   const legs: BudgetReservationIntent[] = [];
   const add = (kind: BudgetReservationIntent["kind"], address: ReturnType<typeof budgetLedgerAddress>, limitMicros: number) => legs.push({
-    kind, objectName: address.objectName,
+    kind, objectName: address.objectName, limitHint: kind === "provider" ? null : auth.policy.limitHint ?? null,
     request: { policyId: address.policyId, windowKey: address.windowKey, scopeKey: address.scopeKey, limitMicros,
       costMicros: cost.reserveMicros, reservationId: randomId("budget"), capability },
   });
   if (policyLimit != null) {
     add("policy", budgetLedgerAddress(auth.policyId, auth.policy, budgetPrincipal(auth), at), policyLimit);
   }
+  if (auth.policy.dailyBudgetMicros != null) add("daily", dailyBudgetLedgerAddress(auth.policyId, auth.policy, budgetPrincipal(auth), at), auth.policy.dailyBudgetMicros);
+  if (auth.policy.weeklyBudgetMicros != null) add("weekly", weeklyBudgetLedgerAddress(auth.policyId, auth.policy, budgetPrincipal(auth), at), auth.policy.weeklyBudgetMicros);
   if (providerLimit != null && connection) add("provider", providerBudgetLedgerAddress(connection.providerId, at), providerLimit);
   return { reservedMicros: cost.reserveMicros, legs };
 }
@@ -76,7 +82,7 @@ export async function reserveBudget(env: Env, auth: AuthorizedIdentity, capabili
     try {
       reservation.reservations.push(await reserveLedgerIntent(env, leg));
     } catch (error) {
-      if (leg.kind === "provider") {
+      if (reservation.reservations.length) {
         try { await settleBudget(env, reservation, 0); }
         catch { throw new HttpError(503, "accounting_unavailable", "Budget reservation rollback could not finish; retry after accounting recovers."); }
       }
@@ -92,8 +98,8 @@ export async function reserveLedgerIntent(env: Env, intent: BudgetReservationInt
   if (!response.ok) throw new Error(`budget reserve returned ${response.status}`);
   const result = await response.json<{ allowed: boolean; chargedMicros: number }>();
   if (typeof result?.allowed !== "boolean") throw new Error("budget reserve was not acknowledged");
-  if (!result.allowed) throw new HttpError(402, intent.kind === "policy" ? "budget_exhausted" : "provider_budget_exhausted",
-    intent.kind === "policy" ? "proxy key budget is exhausted" : `provider ${intent.request.policyId.slice("provider/".length)} monthly budget is exhausted`);
+  if (!result.allowed) throw new HttpError(402, intent.kind === "weekly" ? "weekly_budget_exhausted" : intent.kind === "daily" ? "daily_budget_exhausted" : intent.kind === "policy" ? "budget_exhausted" : "provider_budget_exhausted",
+    withLimitHint(intent.kind === "weekly" ? weeklyBudgetMessage(intent.request.limitMicros) : intent.kind === "daily" ? dailyBudgetMessage(intent.request.limitMicros) : intent.kind === "policy" ? "proxy key budget is exhausted" : `provider ${intent.request.policyId.slice("provider/".length)} monthly budget is exhausted`, intent));
   return { reservationId: intent.request.reservationId, objectName: intent.objectName };
 }
 
