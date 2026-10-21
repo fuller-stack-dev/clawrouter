@@ -105,6 +105,7 @@ quota:
           unit: credit
           remainingPointer: /credits/balance
 capabilities:
+  - {"id":"audio.realtime","endpoint":"realtime","methods":["GET"]}
   - { id: llm.responses.compact, endpoint: responses_compact, methods: [POST] }
   - id: llm.responses
     endpoint: responses
@@ -116,13 +117,10 @@ capabilities:
     endpoint: embeddings
     methods: [POST]
   - {id: audio.transcription, endpoint: transcriptions, methods: [POST]}
-  - id: audio.speech
-    endpoint: speech
-    methods: [POST]
-  - id: image.generation
-    endpoint: images_generations
-    methods: [POST]
+  - {id: audio.speech, endpoint: speech, methods: [POST]}
+  - {id: image.generation, endpoint: images_generations, methods: [POST]}
 endpoints:
+  realtime: {"method":"GET","path":"/v1/realtime","requestFormat":"openai.realtime","responseFormat":"openai.realtime","websocket":"openai.realtime","timeoutMs":120000}
   responses_compact: { path: /v1/responses/compact, requestHeaders: [x-codex-turn-state], requestFormat: openai.responses_compact, responseFormat: openai.responses_compact, timeoutMs: 600000 }
   responses:
     modelPassthrough: {}
@@ -178,6 +176,7 @@ endpoints:
     timeoutMs: 600000
 models:
   entries:
+    - {"id":"openai/gpt-realtime-2.1","upstream":"gpt-realtime-2.1","capabilities":["audio.realtime"],"pricingRef":"openai-realtime-2.1-manual-2026-10-20","pricing":{"effectiveAt":"2026-10-20","source":"https://developers.openai.com/api/docs/pricing","inputMicrosPerMillion":32000000,"outputMicrosPerMillion":64000000,"cachedInputMicrosPerMillion":400000,"maxInputTokens":128000,"maxRequestInputTokens":128000,"defaultMaxOutputTokens":4096,"inputTokenOverhead":0,"settlementBasis":"published_upper_bound"},"nativeCapabilities":{"version":"clawrouter.native-capabilities.v1","endpoints":{"realtime":{"sources":["https://developers.openai.com/api/docs/models/gpt-realtime-2.1"],"checkedAt":"2026-10-20","input":["text","audio"],"contextWindow":128000,"maxOutputTokens":4096,"inference":{"chat":false}}}}}
     - {"id":"openai/gpt-4o-transcribe","upstream":"gpt-4o-transcribe","capabilities":["audio.transcription"],"nativeCapabilities":{"version":"clawrouter.native-capabilities.v1","endpoints":{"transcriptions":{"sources":["https://developers.openai.com/api/docs/models/gpt-4o-transcribe","https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create"],"checkedAt":"2026-10-20","input":["audio"],"contextWindow":16000,"maxOutputTokens":2000}}},"pricingRef":"openai-gpt-4o-transcribe-tokens-2026-10-20","pricing":{"effectiveAt":"2026-10-20","source":"https://developers.openai.com/api/docs/models/gpt-4o-transcribe","inputMicrosPerMillion":2500000,"outputMicrosPerMillion":10000000,"maxInputTokens":16000,"defaultMaxOutputTokens":2000}} # Rates only; no whole-upload hard-budget ceiling.
     - id: openai/gpt-image-2.5-sunburst
       upstream: gpt-image-2.5-sunburst

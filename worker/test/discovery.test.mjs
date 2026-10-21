@@ -391,13 +391,16 @@ test("catalog and session preserve saved provider health independently of operat
         assert.equal(view.readiness.latencyMs, health?.latencyMs ?? null);
         assert.equal(view.readiness.status, blockedStatus ?? probeStatus);
         assert.deepEqual(view.readiness.reasons, [
-          ...(reasonCode ? [reasonCode] : []),
+          ...(reasonCode ? [reasonCode, ...(reasonCode === "budget_exhausted" ? ["grant_transport_unavailable"] : [])] : ["grant_transport_unavailable", ...(mode === "key" ? ["budget_exhausted"] : [])]),
           ...(executable && !verified ? ["Configured but not recently verified by a live smoke test."] : []),
           ...(failure ? [failure] : []),
         ]);
         assert.equal(view.readiness.executable, executable);
         assert.equal(view.offers.some(({ eligible }) => eligible), executable);
-        if (reasonCode) assert.ok(view.offers.every((offer) => !offer.eligible && offer.reasonCode === reasonCode));
+        if (reasonCode) {
+          assert.ok(view.offers.filter(offer => offer.endpoint !== "realtime").every((offer) => !offer.eligible && offer.reasonCode === reasonCode));
+          assert.ok(view.offers.filter(offer => offer.endpoint === "realtime").every(offer => !offer.eligible));
+        }
         if (body.entitlements) assert.deepEqual(body.entitlements.providers.find(({ provider }) => provider === "openai").readiness, view.readiness);
         if (body.catalog) assert.deepEqual(body.providers.find(({ provider }) => provider === "openai").readiness, view.readiness);
         assert.equal(fixture.calls.filter(({ path }) => path === "kv-list").length, 0);
@@ -752,7 +755,11 @@ test("ordered policy selection does not shop for a richer budget", async (t) => 
   for (const [cooldown, expectedPolicy, eligible] of [[false, "fixture", false], [true, "second", true]]) {
     if (cooldown) fixture.states["oauth/fixture/api"] = { grantRevision: null, status: "cooldown", cooldownUntil: new Date(Date.now() + 60_000).toISOString(), windows: [] };
     const catalog = await (await catalogResponse(fixture.request("session"), fixture.env)).json();
-    const offers = catalog.providers.find(({ id }) => id === "openai").offers;
+    const all = catalog.providers.find(({ id }) => id === "openai").offers;
+    const realtime = all.filter(offer => offer.endpoint === "realtime");
+    assert.ok(realtime.length > 0);
+    assert.ok(realtime.every(offer => !offer.eligible && offer.transport === "http" && ["grant_transport_unavailable", "upstream_grant_pool_unavailable"].includes(offer.reasonCode)), "browser session cannot inherit server-only Realtime WebSocket authority");
+    const offers = all.filter(offer => offer.endpoint !== "realtime");
     assert.ok(offers.length > 0);
     assert.ok(offers.every((offer) => offer.policyId === expectedPolicy));
     assert.equal(offers.some((offer) => offer.eligible), eligible);
@@ -829,6 +836,48 @@ test("catalog and HTTP select only configured grants inside the already chosen p
   fixture.records.delete(validKey);
   await compare(false);
   assert.equal(sent.length, 2, "the environment key never replaces the unusable selected pool");
+});
+
+test("merged compact, transcription and hosted-search catalog preserve distinct admission and exact Realtime capacity", async t => {
+  const fixture = await fusionDiscoveryFixture(t);
+  fixture.config.enabled = false;
+  fixture.policy.monthlyBudgetMicros = 10000000;
+  let remaining = 4358143;
+  fixture.env.BUDGET_LEDGER.get = () => ({ fetch: async url => {
+    assert.equal(new URL(url).pathname, "/status", "catalog never reserves or dispatches");
+    return Response.json({ spentMicros: 0, remainingMicros: remaining });
+  } });
+  t.mock.method(globalThis, "fetch", () => assert.fail("catalog must not probe upstream"));
+  for (const [mode, balance, realtimeEligible, searchAdmission] of [
+    ["reserve", 4358143, false, "pricing_required"],
+    ["reserve", 4358144, true, "pricing_required"],
+    ["soft", 4358144, false, "admitted"],
+  ]) {
+    fixture.policy.budgetMode = mode; remaining = balance;
+    const response = await worker.fetch(fixture.request("key"), fixture.env, {});
+    assert.equal(response.status, 200);
+    const catalog = await response.json();
+    assert.equal(catalog.scope.credentialId, "fixture");
+    const provider = catalog.providers.find(row => row.id === "openai");
+    const realtime = provider.offers.find(row => row.modelId === "openai/gpt-realtime-2.1" && row.route === "/v1/native/openai/v1/realtime" && row.transport === "websocket");
+    assert.ok(realtime); assert.equal(realtime.eligible, realtimeEligible);
+    assert.equal(realtime.affordability, realtimeEligible ? "exact-covered" : "exact-blocked");
+    assert.equal(realtime.reasonCode, realtimeEligible ? undefined : mode === "soft" ? "realtime_hard_budget_required" : "budget_exhausted");
+    assert.equal(realtime.hostedToolAdmission, undefined);
+    const compact = provider.offers.find(row => row.modelId === "openai/gpt-6-astra" && row.route === "/v1/responses/compact" && row.transport === "http");
+    assert.ok(compact, "manifest composition must retain the merged unary compaction endpoint and registered model");
+    assert.equal(compact.hostedToolAdmission, undefined, "ordinary Responses hosted-tool facts are not compact evidence");
+    const transcription = provider.offers.find(row => row.modelId === "openai/gpt-4o-transcribe" && row.route === "/v1/audio/transcriptions" && row.transport === "http");
+    assert.ok(transcription, "manifest composition must retain the merged transcription endpoint and model");
+    assert.equal(transcription.eligible, mode === "soft");
+    assert.equal(transcription.affordability, mode === "soft" ? "request-dependent" : "exact-blocked");
+    assert.equal(transcription.reasonCode, mode === "soft" ? undefined : "pricing_required");
+    assert.equal(transcription.hostedToolAdmission, undefined);
+    const search = provider.offers.find(row => row.modelId === "openai/gpt-6-astra" && row.route === "/v1/responses" && row.transport === "http");
+    assert.ok(search); assert.equal(search.eligible, true);
+    assert.deepEqual(search.hostedToolAdmission, { version: "clawrouter.hosted-tool-admission.v1", web_search: searchAdmission });
+    assert.deepEqual(provider.models.find(model => model.id === "openai/gpt-6-astra").nativeCapabilities.endpoints.responses.hostedTools, ["web_search"]);
+  }
 });
 
 async function fusionDiscoveryFixture(t, { bindings } = {}) {
