@@ -1,3 +1,4 @@
+import { GrantRefreshHealth } from "../grant-health";
 import { Status } from "../components";
 import { canProbeGrant, modelHeadroom, planLabel, policyGrants, quotaFree, resetLabel, subscriptionFamilies } from "../subscriptions-data";
 import type { useSubscriptions } from "../hooks/use-subscriptions";
@@ -46,6 +47,7 @@ export function SubscriptionsScreen({ data, policies, grants, providers, refresh
       const canRefresh = canProbeGrant(grant, providers.find(provider => provider.id === grant.provider));
       return <section className="panel subscriptionCard" key={grant.key}>
         <header><div><h2>{grant.label || grant.tokenRef}</h2><p>{grant.account?.email ?? "Account not observed"}</p></div><Status label={grant.credentialStatus === "reauth_required" ? "reauth required" : grant.usable ? "active" : "unavailable"} tone={grant.usable ? "active" : "revoked"} /></header>
+        <GrantRefreshHealth grant={grant} />
         <p>{planLabel(grant.account?.rateLimitTier)} · {grant.provider} · {grant.account?.subscriptionStatus ?? "Status unknown"} · {grant.enabled ? "enabled" : "disabled"} · {grant.kind === "api_key" ? "api_key" : "subscription"} lane</p>
         <div className="subscriptionQuota">{grant.quotaWindows.filter(window => window.kind === "subscription").map(window => {
           const free = quotaFree(window);

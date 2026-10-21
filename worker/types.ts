@@ -265,6 +265,7 @@ export interface UpstreamGrant {
   credentialGeneration?: number;
   credentialLineage?: string;
   credentialStatus?: "active" | "reauth_required";
+  refreshDiagnosis?: import("../shared/contracts").GrantRefreshDiagnosis | null;
   hasCredential?: boolean;
   credentialFields?: string[];
   hasAccessToken?: boolean;
