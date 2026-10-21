@@ -1,4 +1,4 @@
-import { boundedSecret, optionalSecret, boundedRefreshJson, boundedResponseJson, MAX_REFRESH_RESPONSE_BYTES, permanentRefreshFailure, safeOAuthError } from "./grant-refresh-diagnosis.ts";
+import { normalizedScopes, validTimestamp, envValue, boundedSecret, optionalSecret, boundedRefreshJson, boundedResponseJson, MAX_REFRESH_RESPONSE_BYTES, permanentRefreshFailure, safeOAuthError } from "./grant-refresh-diagnosis.ts";
 import { routingProjection } from "./grant-projection.ts";
 import snapshotJson from "./generated/provider-snapshot.json" with { type: "json" };
 import { authorityCall, type GrantAttachmentResult, type GrantAttachmentSnapshot, type GrantAttachmentStatus } from "./authority.ts";
@@ -320,7 +320,7 @@ export class GrantCredentialObject implements DurableObject {
             record = await this.state.storage.get<CredentialRecord>("credential") ?? record;
             changed = true;
             if (record.status !== "reauth_required") {
-              await this.schedule(record);
+              await this.deferRefresh(record);
             } else await this.state.storage.deleteAlarm();
             throw error;
           }
@@ -431,7 +431,7 @@ export class GrantCredentialObject implements DurableObject {
       try { record = { ...await this.refresh(record, provider.id, provider.auth.refresh), nextRefreshAttemptAt: null }; }
       catch {
         record = await this.state.storage.get<CredentialRecord>("credential") ?? record;
-        if (record.status !== "reauth_required") await this.schedule(record);
+        if (record.status !== "reauth_required") await this.deferRefresh(record);
       }
       if (record.status === "reauth_required") {
         await this.publishProjection(record);
@@ -484,9 +484,22 @@ export class GrantCredentialObject implements DurableObject {
         // The refresh failure and its diagnosis are durable already. Never let
         // the quota caller's finally block write the rejected snapshot over it.
         Object.assign(record, await this.state.storage.get<CredentialRecord>("credential") ?? current);
+        if (record.status !== "reauth_required") await this.deferRefresh(record);
         throw error;
       }
     });
+  }
+
+  private async deferRefresh(record: CredentialRecord): Promise<void> {
+    // Preserve the existing delay even when rotation could not be persisted.
+    // Outcome/consumption recovery is separate; never turn a write failure into
+    // a one-second alarm replay of the previous refresh token.
+    if (!(timestamp(record.nextRefreshAttemptAt) > Date.now())) {
+      record.nextRefreshAttemptAt = new Date(Date.now() + REFRESH_MARGIN_MS).toISOString();
+      if (record.refreshDiagnosis?.failure) record.refreshDiagnosis.failure.nextRetryAt = record.nextRefreshAttemptAt;
+      await this.state.storage.put("credential", record);
+    }
+    await this.schedule(record);
   }
 
   private async recordRefreshFailure(record: CredentialRecord, status: number | null, code: unknown): Promise<CredentialRecord> {
@@ -858,7 +871,7 @@ function updatedCredentialRecord(current: CredentialRecord | undefined, grant: U
   const replaced = ["credential", "accessToken", "refreshToken"].some(key => {
     const value = updated[key as keyof CredentialRecord];
     return typeof value === "string" && value !== current[key as keyof CredentialRecord];
-  }) || JSON.stringify(updated.credentials) !== JSON.stringify(current.credentials);
+  }) || JSON.stringify(Object.entries(updated.credentials ?? {}).sort()) !== JSON.stringify(Object.entries(current.credentials ?? {}).sort());
   if (replaced) { updated.status = "active"; updated.refreshDiagnosis = null; updated.nextRefreshAttemptAt = null; }
   // Explicit credential/account replacement is not a refresh, even when the
   // operator keeps the same account label. Refresh-token replacement also can
@@ -978,21 +991,4 @@ function normalizedCredentials(value: Record<string, string>): Record<string, st
     if (!/^[A-Za-z0-9_.-]{1,128}$/.test(name)) throw new HttpError(400, "invalid_upstream_grant", "credential bundle contains an invalid field name");
     return [name, boundedSecret(secret, `credential ${name}`)];
   }));
-}
-
-function normalizedScopes(value: string[] | undefined): string[] | undefined {
-  if (value == null) return undefined;
-  if (!Array.isArray(value) || value.length > 128 || value.some((scope) => typeof scope !== "string" || !scope || scope.length > 512)) throw new HttpError(400, "invalid_upstream_grant", "grant scopes are invalid");
-  return [...new Set(value)];
-}
-
-function validTimestamp(value: string | null | undefined): string | null | undefined {
-  if (value == null) return value;
-  if (!Number.isFinite(Date.parse(value))) throw new HttpError(400, "invalid_upstream_grant", "grant expiry is invalid");
-  return new Date(value).toISOString();
-}
-
-function envValue(env: Env, key: string): string | null {
-  const value = env[key];
-  return typeof value === "string" && value.trim() ? value : null;
 }

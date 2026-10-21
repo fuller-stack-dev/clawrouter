@@ -10,23 +10,43 @@ const router = `
   export * from "./worker/index.ts";
   import handler from "./worker/index.ts";
   import { GrantCredentialObject as CredentialOwner } from "./worker/grant-credentials.ts";
-  // Fault only the KV projection boundary; the owner, its SQLite storage,
+  // Inject one failure at a storage boundary; owner logic, SQLite persistence,
   // serialization, refresh exchange and admin routes remain real.
   export class GrantCredentialObject extends CredentialOwner {
     constructor(state, env) {
-      super(state, { ...env, POLICY_KV: new Proxy(env.POLICY_KV, { get(target, name) {
+      const storage = new Proxy(state.storage, { get(target, name) {
+        if (name === "put") return async (...args) => {
+          if (args[0] === "credential" && args[1]?.accessToken === "fixture-rotated" && await env.POLICY_KV.get("fixture/fail-rotation-write") === "yes") {
+            await env.POLICY_KV.delete("fixture/fail-rotation-write");
+            throw new Error("fixture rotation write unavailable");
+          }
+          return target.put(...args);
+        };
+        const value = target[name]; return typeof value === "function" ? value.bind(target) : value;
+      } });
+      super(new Proxy(state, { get(target, name) {
+        if (name === "storage") return storage;
+        const value = target[name]; return typeof value === "function" ? value.bind(target) : value;
+      } }), { ...env, POLICY_KV: new Proxy(env.POLICY_KV, { get(target, name) {
         if (name === "put") return async (...args) => {
           if (args[0].startsWith("oauth/") && await target.get("fixture/fail-projection") === "yes") throw new Error("fixture projection unavailable");
           return target.put(...args);
         };
         const value = target[name]; return typeof value === "function" ? value.bind(target) : value;
       } }) });
+      this.fixtureStorage = state.storage;
+    }
+    async fetch(request) {
+      if (new URL(request.url).pathname === "/fixture/alarm-state") return Response.json({ alarm: await this.fixtureStorage.getAlarm(), nextRefreshAttemptAt: (await this.fixtureStorage.get("credential"))?.nextRefreshAttemptAt });
+      return super.fetch(request);
     }
   }
   import { sha256Hex } from "./worker/utils.ts";
   export default { async fetch(request, env, ctx) {
     env.CLAWROUTER_LOCAL_AUTH = "enabled";
     env.CLAWROUTER_ADMIN_TOKEN_SHA256 = await sha256Hex("fixture-admin");
+    if (new URL(request.url).pathname === "/fixture/fail-rotation-write") { await env.POLICY_KV.put("fixture/fail-rotation-write", "yes"); return new Response("ok"); }
+    if (new URL(request.url).pathname === "/fixture/alarm-state") return env.GRANT_CREDENTIALS.get(env.GRANT_CREDENTIALS.idFromName("oauth/pool/claude")).fetch(request);
     if (new URL(request.url).pathname === "/fixture/fail-projection") { await env.POLICY_KV.put("fixture/fail-projection", "yes"); return new Response("ok"); }
     if (new URL(request.url).pathname === "/fixture/provider") return fetch("https://fixture/control", request);
     return handler.fetch(request, env, ctx);
@@ -198,4 +218,25 @@ test("workerd admin diagnosis reads the owner after a failed KV projection, incl
   assert.equal(row.refreshDiagnosis.failure.oauthError, "invalid_grant");
   await f.restart();
   assert.deepEqual((await f.row()).refreshDiagnosis, row.refreshDiagnosis);
+});
+
+test("workerd a failed rotation write retains the existing five-minute retry delay", { timeout: 60000 }, async t => {
+  const f = await fixture(t); await f.configure({});
+  await f.request("/fixture/fail-rotation-write", "POST");
+  assert.equal((await f.request(`${f.base}?mode=replace`, "PUT", { ...f.grant, expiresAt: "2020-01-01T00:00:00Z" })).status, 200);
+  assert.equal((await f.request(`${f.base}/refresh`, "POST")).status, 500);
+  const { alarm, nextRefreshAttemptAt } = await (await f.request("/fixture/alarm-state")).json();
+  assert.ok(Date.parse(nextRefreshAttemptAt) >= Date.now() + 240000, "retain the five-minute refresh retry window");
+  assert.ok(alarm > Date.now() + 10000, "the shared quota alarm must not turn the retry delay into a one-second refresh loop");
+  assert.equal((await f.row()).credentialStatus, "active");
+  assert.equal((await f.row()).refreshDiagnosis, null, "uncommitted rotation is not a successful refresh");
+});
+
+test("workerd reordering an unchanged credential bundle cannot clear terminal state", { timeout: 60000 }, async t => {
+  const f = await fixture(t); await f.configure({ failure: "invalid_grant" });
+  assert.equal((await f.request(`${f.base}?mode=replace`, "PUT", { ...f.grant, credentials: { first: "fixture-one", second: "fixture-two" } })).status, 200);
+  assert.equal((await f.request(`${f.base}/refresh`, "POST")).status, 401);
+  const edited = await f.request(f.base, "PUT", { provider: "anthropic", kind: "subscription", credentials: { second: "fixture-two", first: "fixture-one" } });
+  assert.equal(edited.status, 200);
+  assert.equal((await f.row()).credentialStatus, "reauth_required");
 });

@@ -59,3 +59,20 @@ export function boundedSecret(value: unknown, name: string): string {
   if (typeof value !== "string" || !value || new TextEncoder().encode(value).byteLength > MAX_SECRET_BYTES) throw new HttpError(400, "invalid_upstream_grant", `${name} must be a non-empty bounded string`);
   return value;
 }
+
+export function normalizedScopes(value: string[] | undefined): string[] | undefined {
+  if (value == null) return undefined;
+  if (!Array.isArray(value) || value.length > 128 || value.some((scope) => typeof scope !== "string" || !scope || scope.length > 512)) throw new HttpError(400, "invalid_upstream_grant", "grant scopes are invalid");
+  return [...new Set(value)];
+}
+
+export function validTimestamp(value: string | null | undefined): string | null | undefined {
+  if (value == null) return value;
+  if (!Number.isFinite(Date.parse(value))) throw new HttpError(400, "invalid_upstream_grant", "grant expiry is invalid");
+  return new Date(value).toISOString();
+}
+
+export function envValue(env: Record<string, unknown>, key: string): string | null {
+  const value = env[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
