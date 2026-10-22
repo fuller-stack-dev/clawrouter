@@ -179,6 +179,20 @@ export interface FusionReadiness {
   calls: FusionReadinessCall[];
 }
 
+// Owner-issued facts only. Provider descriptions and arbitrary error strings are never retained.
+export interface GrantRefreshDiagnosis {
+  lastSuccessfulRefreshAt: string | null;
+  failure: {
+    oauthError: string;
+    httpStatus: number | null;
+    failureClass: "permanent" | "transient";
+    firstFailureAt: string;
+    lastFailureAt: string;
+    attemptCount: number;
+    nextRetryAt: string | null;
+  } | null;
+}
+
 export interface UpstreamGrant {
   key: string;
   scope: "policies" | "tenants";
@@ -205,6 +219,7 @@ export interface UpstreamGrant {
   hasAccessToken: boolean;
   hasRefreshToken: boolean;
   credentialStatus?: "active" | "reauth_required";
+  refreshDiagnosis?: GrantRefreshDiagnosis | null;
   refreshConfigured: boolean;
   usable: boolean;
   selectedCount: number;

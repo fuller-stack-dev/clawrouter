@@ -107,6 +107,10 @@ export function AppShell() {
         {view === "home" ? (
           <DashboardScreen
             session={session}
+            grants={upstreamGrants}
+            grantsReady={upstream.ready}
+            grantsError={shell.refreshError}
+            onOpenGrant={(grant) => { editUpstreamGrant(grant); setAccessTab("upstream"); navigateTo("policies"); }}
             services={services}
             policies={keys}
             credentials={credentials}

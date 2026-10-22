@@ -1,3 +1,4 @@
+import { GrantPoolIncidents } from "../grant-health";
 import { credentialExpiryLabel, KeyTierControls, keyTierChoices } from "../member-key-controls";
 import type { SessionPolicyLimits } from "../../../shared/contracts";
 import React, { useEffect, useState } from "react";
@@ -49,6 +50,7 @@ import { CredentialNotice, type CredentialFeedback } from "../credential-notice"
 import { EntityTable, UsageFreshness } from "./users-usage";
 import type {
   AccessPolicy,
+  UpstreamGrant,
   AccessUser,
   AdminOverview,
   AdminTenantSummary,
@@ -75,7 +77,11 @@ export function UserAvatar({ email }: { email?: string | null }) {
   );
 }
 
-export function DashboardScreen({ session, services, policies, credentials, users, tenants, overview, usageRows, usage, usageLoaded, usageStale, usageError, usageUpdatedAt, myCredentials, myPolicyLimits, myPolicyIds, myKeyFeedback, myKeyScope, myKeysBusy, onMyKeyDraftChange, onIssueMyKey, onRevokeMyKey, onRenameMyKey, onOpenCatalog, onOpenPlayground, onOpenUsage, onOpenAccess }: {
+export function DashboardScreen({ grants, grantsReady, grantsError, onOpenGrant, session, services, policies, credentials, users, tenants, overview, usageRows, usage, usageLoaded, usageStale, usageError, usageUpdatedAt, myCredentials, myPolicyLimits, myPolicyIds, myKeyFeedback, myKeyScope, myKeysBusy, onMyKeyDraftChange, onIssueMyKey, onRevokeMyKey, onRenameMyKey, onOpenCatalog, onOpenPlayground, onOpenUsage, onOpenAccess }: {
+  grants: UpstreamGrant[];
+  grantsReady: boolean;
+  grantsError: string;
+  onOpenGrant: (grant: UpstreamGrant) => void;
   session: SessionResponse;
   services: ServiceItem[];
   policies: AccessPolicy[];
@@ -134,6 +140,7 @@ export function DashboardScreen({ session, services, policies, credentials, user
         </div>
       </header>
 
+      {isAdmin ? <GrantPoolIncidents policies={policies} grants={grants} ready={grantsReady} error={grantsError} onOpenGrant={onOpenGrant} /> : null}
       <UsageFreshness loaded={usageLoaded} stale={usageStale} error={usageError} updatedAt={usageUpdatedAt} />
       <section className="dashboardStats" aria-label="access overview">
         <DashboardStat label={isAdmin ? "catalog coverage" : "available services"} value={isAdmin ? `${configuredServices.length}/${services.length}` : String(grantedServices.length)} note={isAdmin ? `${services.length - configuredServices.length} need attention` : `${usableServices.length} ready to call`} />

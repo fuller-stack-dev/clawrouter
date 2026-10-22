@@ -161,7 +161,7 @@ test("reserve selection stops before extra usage without restricting an API-key 
   assert.equal(grantQuotaExhausted({ windows: [{ remaining: 0, limit: 100, resetAt: null, models: ["fable"] }] }, "claude-fable-5-1"), true);
 });
 
-test("profile throttling does not block usage updates; profile 401 requires reauthorization", async t => {
+test("profile throttling does not block usage updates; profile 401 alone cannot revoke refresh authority", async t => {
   const f = await fixture(t); let profileCalls = 0, usageCalls = 0;
   t.mock.method(globalThis, "fetch", async url => {
     if (String(url).endsWith("/usage")) { usageCalls++; return Response.json(usage(10 + usageCalls)); }
@@ -175,9 +175,10 @@ test("profile throttling does not block usage updates; profile 401 requires reau
   const record = owner.values.get("credential"); record.quotaRetryAt = {}; owner.values.set("credential", record);
   t.mock.restoreAll(); t.mock.method(globalThis, "fetch", async url => String(url).endsWith("/usage") ? Response.json(usage()) : new Response(null, { status: 401 }));
   await assert.rejects(refreshStoredGrantQuota(f.env, key));
-  assert.equal(owner.values.get("credential").status, "reauth_required");
-  assert.equal(owner.alarm(), null);
-  assert.equal(f.values.get(key).credentialStatus, "reauth_required");
+  assert.equal(owner.values.get("credential").status, "active");
+  assert.ok(owner.alarm() > Date.now());
+  assert.equal(f.values.get(key).credentialStatus, "active");
+  assert.equal(f.values.get(key).refreshDiagnosis.failure.failureClass, "transient");
 });
 
 test("collection readings replace duplicate legacy model-window IDs", () => {
@@ -339,9 +340,9 @@ test("null allowlist preserves native inference and Opus 5.5 uses its compiled p
   const response = await handler.fetch(new Request("https://router.example/v1/messages", { method: "POST", headers, body: JSON.stringify({ model: "anthropic/claude-opus-5-5", max_tokens: 1, messages: [] }) }), f.env, f.context);
   assert.equal(response.status, 200, await response.clone().text()); await response.text();
   while (f.pending.length) await Promise.all(f.pending.splice(0));
-  const model = provider.models.find(model => model.id === "anthropic/claude-opus-5-5");
-  assert.equal(model.pricing_ref, "anthropic-claude-opus-5-5-standard-2026-10-11");
-  assert.deepEqual(model.pricing, { effectiveAt: "2026-10-11", source: "https://platform.claude.com/docs/en/about-claude/pricing", inputMicrosPerMillion: 4000000, cachedInputMicrosPerMillion: 200000, cacheWrite5mInputMicrosPerMillion: 5000000, cacheWrite1hInputMicrosPerMillion: 8000000, outputMicrosPerMillion: 20000000, maxInputTokens: 1000000, defaultMaxOutputTokens: 128000, cacheWriteInputMicrosPerMillion: null, maxRequestInputTokens: null, inputTokenOverhead: 1024, longContext: null });
+  assert.equal(f.events.length, 1);
+  assert.equal(f.events[0].pricing_ref, "anthropic-claude-opus-5-5-standard-2026-10-11");
+  assert.equal(f.events[0].actual_cost_micros, 60, "10 input and 1 output tokens are settled at the compiled Opus 5.5 rates");
 });
 
 test("pool is opt-in, scope-bound, explicitly projected, and shares scoped reserve eligibility", async t => {
