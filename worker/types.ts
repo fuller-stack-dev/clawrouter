@@ -335,7 +335,7 @@ export interface AuthorizedIdentity {
 }
 
 export interface UsageEvent {
-  realtime_usage?: { unit_id: string; response_id: string | null; output_cap: number; text_input_tokens?: number; audio_input_tokens?: number; cached_text_input_tokens?: number; cached_audio_input_tokens?: number; text_output_tokens?: number; audio_output_tokens?: number };
+  realtime_usage?: { item_id?: string | null; unit_id: string; response_id: string | null; output_cap: number; text_input_tokens?: number; audio_input_tokens?: number; cached_text_input_tokens?: number; cached_audio_input_tokens?: number; text_output_tokens?: number; audio_output_tokens?: number };
   hosted_tool_calls?: { web_search: number };
   hosted_tool_calls_complete?: boolean;
   hosted_tool_cost_micros?: number | null;
