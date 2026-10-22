@@ -185,7 +185,7 @@ export interface GrantRefreshDiagnosis {
   failure: {
     oauthError: string;
     httpStatus: number | null;
-    failureClass: "permanent" | "transient";
+    failureClass: "permanent" | "retry_after" | "transient" | "ambiguous" | "provider_ok_persist_failed";
     firstFailureAt: string;
     lastFailureAt: string;
     attemptCount: number;
@@ -220,6 +220,7 @@ export interface UpstreamGrant {
   hasRefreshToken: boolean;
   credentialStatus?: "active" | "reauth_required";
   refreshDiagnosis?: GrantRefreshDiagnosis | null;
+  credentialProvenance?: "clawrouter_oauth" | "imported" | null;
   refreshConfigured: boolean;
   usable: boolean;
   selectedCount: number;

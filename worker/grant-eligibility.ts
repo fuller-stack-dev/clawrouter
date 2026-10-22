@@ -3,6 +3,7 @@ import { assertOperationConfiguration, grantSupports, type GrantRequirement } fr
 import { grantCoolingDown, grantQuotaExhausted, grantQuotaResetAt, grantRuntimeFresh } from "./grant-quota.ts";
 import type { Env, GrantRoutingPolicy, GrantRuntimeState, UpstreamGrant } from "./types";
 
+export const REFRESH_MARGIN_MS = 5 * 60_000;
 const DEFAULT_GRANT_PRIORITY = 100;
 const DEFAULT_GRANT_WEIGHT = 1;
 export const DEFAULT_GRANT_ROUTING: GrantRoutingPolicy = {
@@ -57,7 +58,18 @@ export interface GrantSelectionResult {
 }
 export type PinnedGrant = { key: string | null; revision: string | null } | { key: string; lineage: string };
 
-export function grantUsable(grant: UpstreamGrant): boolean {
+export function grantUsable(grant: UpstreamGrant, nowMs = Date.now()): boolean {
+  return grantCredentialPresent(grant) && !grantRefreshBlocked(grant, nowMs);
+}
+
+function grantRefreshBlocked(grant: UpstreamGrant, nowMs: number): boolean {
+  const until = grant.credentialRefreshBlockedUntil;
+  return grant.credentialStore === "durable_object" && (until === null
+    || !!grant.hasRefreshToken && !!grant.expiresAt && Date.parse(grant.expiresAt) <= nowMs + REFRESH_MARGIN_MS
+    && typeof until === "string" && Date.parse(until) > nowMs);
+}
+
+export function grantCredentialPresent(grant: UpstreamGrant): boolean {
   if (grant.credentialStore === "durable_object") {
     return grant.credentialStatus !== "reauth_required" && !!(grant.hasCredential || grant.hasAccessToken);
   }
@@ -95,11 +107,14 @@ function operationConfigured(grant: UpstreamGrant, env: Env, requirement?: Grant
 }
 
 export function filterGrantCandidates(providerId: string, candidates: Array<{ key: string; grant: UpstreamGrant | null; runtimeState: GrantRuntimeState | null }>, excludedKeys: ReadonlySet<string>, routing: GrantRoutingPolicy, pinnedKey: string | null | undefined, requirement: GrantRequirement | undefined, nowMs: number): GrantCandidates {
-  const configured = candidates.filter((entry): entry is SelectedGrant => !!entry.grant && entry.grant.enabled !== false && (!entry.grant.provider || entry.grant.provider === providerId) && grantUsable(entry.grant));
+  const configured = candidates.filter((entry): entry is SelectedGrant => !!entry.grant && entry.grant.enabled !== false && (!entry.grant.provider || entry.grant.provider === providerId) && grantCredentialPresent(entry.grant));
   const eligibilityRestricted = Object.prototype.hasOwnProperty.call(routing.eligibleGrants, providerId);
   const eligibleRefs = routing.eligibleGrants[providerId] ?? [];
   const recovering: Array<{ entry: SelectedGrant; atMs: number }> = [];
   const available = configured.filter((entry) => {
+    // Keep configured-pool presence (and pinned owner error semantics) even
+    // when refresh cannot currently produce a dispatchable access token.
+    if (pinnedKey === undefined && grantRefreshBlocked(entry.grant, nowMs)) return false;
     if (requirement && !grantSupports(requirement, entry.grant)) return false;
     if (pinnedKey !== undefined && entry.key !== pinnedKey) return false;
     if (excludedKeys.has(entry.key)) return false;

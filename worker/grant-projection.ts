@@ -4,7 +4,7 @@ import type { UpstreamGrant } from "./types";
 // An allowlist, rather than object spread: neither legacy secrets nor future
 // credential fields may enter the global authority's routing index.
 export function routingProjection(grant: UpstreamGrant): UpstreamGrant {
-  const fields = ["version", "enabled", "priority", "weight", "kind", "provider", "label", "credentialStore", "credentialGeneration", "credentialLineage", "credentialStatus", "hasCredential", "credentialFields", "hasAccessToken", "hasRefreshToken", "tokenType", "expiresAt", "scopes", "accountId", "subscription", "createdAt", "updatedAt", "revokedAt"] as const;
+  const fields = ["version", "enabled", "priority", "weight", "kind", "provider", "label", "credentialStore", "credentialGeneration", "credentialLineage", "credentialStatus", "credentialRefreshBlockedUntil", "hasCredential", "credentialFields", "hasAccessToken", "hasRefreshToken", "tokenType", "expiresAt", "scopes", "accountId", "subscription", "createdAt", "updatedAt", "revokedAt"] as const;
   return Object.fromEntries(fields.filter(field => grant[field] !== undefined).map(field => [field, grant[field]]));
 }
 

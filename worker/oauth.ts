@@ -72,7 +72,7 @@ export async function oauthCallback(request: Request, env: Env): Promise<Respons
   };
   grant.priority = Number.isInteger(state.priority) ? state.priority : existing?.priority ?? 100;
   grant.weight = typeof state.weight === "number" && Number.isFinite(state.weight) && state.weight > 0 ? state.weight : existing?.weight ?? 1;
-  await putGrantCredentials(env, state.grantKey, grant, true);
+  await putGrantCredentials(env, state.grantKey, grant, true, undefined, "clawrouter_oauth");
   return callbackPage(true, `${provider.display_name} connection saved.`);
 }
 

@@ -48,7 +48,7 @@ export function permanentRefreshFailure(status: number, code: unknown): boolean 
 // Strict allowlist, not truncation: even a short provider "code" can contain a
 // credential fragment. Unknown strings/descriptions never cross the owner boundary.
 export function safeOAuthError(code: unknown): string {
-  return typeof code === "string" && ["invalid_grant", "invalid_token", "refresh_token_reused", "invalid_client", "unauthorized_client", "invalid_request", "unsupported_grant_type", "invalid_scope", "temporarily_unavailable", "server_error", "network_error", "invalid_response"].includes(code) ? code : "unknown_error";
+  return typeof code === "string" && ["invalid_grant", "invalid_token", "refresh_token_reused", "invalid_client", "unauthorized_client", "invalid_request", "unsupported_grant_type", "invalid_scope", "temporarily_unavailable", "server_error", "network_error", "invalid_response", "outcome_unknown", "persistence_failed"].includes(code) ? code : "unknown_error";
 }
 
 export function optionalSecret(value: string | null | undefined, name: string): string | null | undefined {
@@ -75,4 +75,18 @@ export function validTimestamp(value: string | null | undefined): string | null 
 export function envValue(env: Record<string, unknown>, key: string): string | null {
   const value = env[key];
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+/** Equal jitter, 15–30s initially, exponential to a 2m cap. Preserve at least
+ * another attempt before access expiry where possible; Retry-After is a floor,
+ * even when the provider asks us to wait past expiry. Never turn it into a loop. */
+export function refreshRetryAt(attempt: number, expiresAt?: string | null, retryAfter?: string | null): string {
+  const now = Date.now();
+  const ceiling = Math.min(120_000, 30_000 * 2 ** Math.min(10, Math.max(0, attempt - 1)));
+  let delay = Math.floor(ceiling / 2 + Math.random() * ceiling / 2);
+  const remaining = Date.parse(expiresAt ?? "") - now;
+  if (remaining > 2_000) delay = Math.min(delay, Math.max(1_000, Math.floor(remaining / 2)));
+  const providerTime = retryAfter && /^\d+(?:\.\d+)?$/.test(retryAfter) ? now + Number(retryAfter) * 1_000 : Date.parse(retryAfter ?? "");
+  const next = Math.max(now + 1_000, now + delay, Number.isFinite(providerTime) && providerTime <= 8.64e15 ? providerTime : 0);
+  return new Date(next).toISOString();
 }

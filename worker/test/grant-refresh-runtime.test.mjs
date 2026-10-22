@@ -9,6 +9,7 @@ import { startWorkerdFixture } from "../../test/helpers/workerd.mjs";
 const router = `
   export * from "./worker/index.ts";
   import handler from "./worker/index.ts";
+  let clock = ${Date.now() + 86400000}; Date.now = () => clock;
   import { GrantCredentialObject as CredentialOwner } from "./worker/grant-credentials.ts";
   // Inject one failure at a storage boundary; owner logic, SQLite persistence,
   // serialization, refresh exchange and admin routes remain real.
@@ -48,6 +49,7 @@ const router = `
     if (new URL(request.url).pathname === "/fixture/fail-rotation-write") { await env.POLICY_KV.put("fixture/fail-rotation-write", "yes"); return new Response("ok"); }
     if (new URL(request.url).pathname === "/fixture/alarm-state") return env.GRANT_CREDENTIALS.get(env.GRANT_CREDENTIALS.idFromName("oauth/pool/claude")).fetch(request);
     if (new URL(request.url).pathname === "/fixture/fail-projection") { await env.POLICY_KV.put("fixture/fail-projection", "yes"); return new Response("ok"); }
+    if (new URL(request.url).pathname === "/fixture/clock") { clock = (await request.json()).now; return new Response("ok"); }
     if (new URL(request.url).pathname === "/fixture/provider") return fetch("https://fixture/control", request);
     return handler.fetch(request, env, ctx);
   } };
@@ -132,7 +134,7 @@ test("workerd permanent rejection persists safe diagnosis, metadata edits preser
   assert.equal((await f.calls()).length, 0, "restart and metadata edits cannot re-enable provider I/O");
   const unauthorized = await f.request("/v1/admin/upstream-grants", "GET", undefined, false);
   assert.equal(unauthorized.status, 401);
-  const replaced = await f.request(`${f.base}?mode=replace`, "PUT", f.grant);
+  const replaced = await f.request(`${f.base}?mode=replace`, "PUT", { ...f.grant, refreshToken: "fixture-fresh-authorization" });
   assert.equal(replaced.status, 200);
   assert.equal((await f.row()).credentialStatus, "active");
   assert.equal((await f.row()).refreshDiagnosis, null);
@@ -146,12 +148,14 @@ test("workerd refresh failures retain bounded secretless diagnosis across attemp
   assert.equal(first.refreshDiagnosis.failure.failureClass, "transient");
   assert.equal(first.refreshDiagnosis.failure.httpStatus, 503);
   assert.ok(Date.parse(first.refreshDiagnosis.failure.nextRetryAt) > Date.now());
+  await f.request("/fixture/clock", "POST", { now: Date.parse(first.refreshDiagnosis.failure.nextRetryAt) });
   await f.configure({ failure: "fixture-refresh".repeat(100), status: 503 });
   assert.equal((await f.request(`${f.base}/quota-refresh`, "POST")).status, 502);
   const second = await f.row();
   assert.equal(second.refreshDiagnosis.failure.oauthError, "unknown_error");
   assert.equal(second.refreshDiagnosis.failure.firstFailureAt, first.refreshDiagnosis.failure.firstFailureAt);
   assert.equal(second.refreshDiagnosis.failure.attemptCount, 2);
+  await f.request("/fixture/clock", "POST", { now: Date.parse(second.refreshDiagnosis.failure.nextRetryAt) });
   await f.configure({});
   assert.equal((await f.request(`${f.base}/quota-refresh`, "POST")).status, 200);
   assert.equal((await f.row()).refreshDiagnosis.failure, null);
@@ -194,7 +198,7 @@ for (const [name, config, code, status] of [
   assert.equal(row.credentialStatus, "active");
   assert.equal(row.refreshDiagnosis.failure.oauthError, code);
   assert.equal(row.refreshDiagnosis.failure.httpStatus, status);
-  assert.equal(row.refreshDiagnosis.failure.failureClass, "transient");
+  assert.equal(row.refreshDiagnosis.failure.failureClass, status === 429 ? "retry_after" : status === 200 ? "ambiguous" : "transient");
   assert.equal((await f.calls()).filter(call => call.path.endsWith("/token")).length, 1);
 });
 
@@ -220,16 +224,17 @@ test("workerd admin diagnosis reads the owner after a failed KV projection, incl
   assert.deepEqual((await f.row()).refreshDiagnosis, row.refreshDiagnosis);
 });
 
-test("workerd a failed rotation write retains the existing five-minute retry delay", { timeout: 60000 }, async t => {
+test("workerd a failed rotation write fences replay instead of scheduling the consumed token", { timeout: 60000 }, async t => {
   const f = await fixture(t); await f.configure({});
   await f.request("/fixture/fail-rotation-write", "POST");
   assert.equal((await f.request(`${f.base}?mode=replace`, "PUT", { ...f.grant, expiresAt: "2020-01-01T00:00:00Z" })).status, 200);
-  assert.equal((await f.request(`${f.base}/refresh`, "POST")).status, 500);
+  assert.equal((await f.request(`${f.base}/refresh`, "POST")).status, 502);
   const { alarm, nextRefreshAttemptAt } = await (await f.request("/fixture/alarm-state")).json();
-  assert.ok(Date.parse(nextRefreshAttemptAt) >= Date.now() + 240000, "retain the five-minute refresh retry window");
+  assert.equal(nextRefreshAttemptAt, null, "a possibly consumed refresh token cannot be replayed on a timer");
   assert.ok(alarm > Date.now() + 10000, "the shared quota alarm must not turn the retry delay into a one-second refresh loop");
   assert.equal((await f.row()).credentialStatus, "active");
-  assert.equal((await f.row()).refreshDiagnosis, null, "uncommitted rotation is not a successful refresh");
+  assert.equal((await f.row()).refreshDiagnosis.lastSuccessfulRefreshAt, null, "uncommitted rotation is not a successful refresh");
+  assert.equal((await f.row()).refreshDiagnosis.failure.failureClass, "provider_ok_persist_failed");
 });
 
 test("workerd reordering an unchanged credential bundle cannot clear terminal state", { timeout: 60000 }, async t => {

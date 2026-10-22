@@ -350,7 +350,7 @@ test("transient refresh failures schedule one retry window instead of hammering 
   const values = new Map([[key, legacyGrant({ expiresAt: "2020-01-01T00:00:00.000Z" })]]);
   const env = credentialEnv(values);
   let calls = 0;
-  context.mock.method(globalThis, "fetch", async () => { calls += 1; throw new Error("offline"); });
+  context.mock.method(globalThis, "fetch", async () => { calls += 1; return Response.json({ error: "server_error" }, { status: 503 }); });
   await assert.rejects(() => materializeGrantCredentials(env, key, values.get(key), "openai", refreshConfig(), false), (error) => error?.code === "grant_refresh_failed");
   assert.equal(values.get(key).accessToken, undefined, "failed legacy refresh still scrubs the migrated KV secret");
   await assert.rejects(() => materializeGrantCredentials(env, key, values.get(key), "openai", refreshConfig(), false), (error) => error?.code === "grant_refresh_failed");
@@ -414,7 +414,12 @@ for (const failure of ["index", "storage"]) test(`negative upgrade migration ret
   }
   assert.equal(values.get(key).enabled, false);
   await owner.object.alarm();
-  assert.equal(syncs, failure === "index" ? 2 : 1);
+  // Preflight reconciles the authority; final publication idempotently repeats
+  // that ACK and retires pending state only after KV also sees the tombstone.
+  assert.equal(syncs, failure === "index" ? 3 : 2);
+  assert.equal(owner.values.get("credential").poolSyncPending, false);
+  assert.equal(values.get(key).hasAccessToken, false);
+  assert.equal(values.get(key).revokedAt, owner.values.get("credential").revokedAt);
   assert.equal(owner.values.get("credential").enabled, false);
   assert.equal(owner.values.get("credential").accessToken, undefined);
   assert.equal(owner.alarm(), null);
@@ -534,7 +539,7 @@ function credentialEnv(values) {
       },
       async put(key, value) { values.set(key, JSON.parse(value)); },
     },
-  });
+  }, { kvValues: values });
 }
 
 function rateLimitKv(env) {

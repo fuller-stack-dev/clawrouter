@@ -48,6 +48,11 @@ const upstreamScript = `
     if (url.pathname === "/fixture/calls") return Response.json(calls);
     calls.push({ url: request.url, method: request.method, headers: Object.fromEntries(request.headers), body: await request.text() });
     if (url.pathname === "/redirect-target") return Response.json({ access_token: "fixture-stolen", error: "invalid_grant" }, { status: 400 });
+    if (config.recoverThenRedirect && url.pathname.endsWith("/usage")) {
+      return request.headers.get("authorization") === "Bearer fixture-access-old"
+        ? new Response(null, { status: 401 })
+        : new Response(null, { status: 307, headers: { location: "/redirect-target" } });
+    }
     if (config.status && (!config.onlyPath || config.onlyPath === url.pathname)) {
       const location = config.crossOrigin ? "https://redirect.example/redirect-target" : "/redirect-target";
       return new Response(config.status === 304 ? null : JSON.stringify({ error: "invalid_grant" }), { status: config.status, headers: {
@@ -78,9 +83,10 @@ async function fixture(t) {
   let sequence = 0;
   async function grant(provider, extra = {}) {
     const key = `oauth/fixture/grant-${++sequence}`, owner = namespace.get(namespace.idFromName(key));
-    const response = await post(owner, "/put", { key, grant: { provider, kind: "subscription", enabled: true, accessToken: "fixture-access-old", refreshToken: "fixture-refresh-old", accountId: "fixture-account", expiresAt: new Date(Date.now() + 3600000).toISOString(), ...extra }, preserveUnspecifiedSecrets: false });
+    const refreshToken = "fixture-refresh-old-" + sequence;
+    const response = await post(owner, "/put", { key, grant: { provider, kind: "subscription", enabled: true, accessToken: "fixture-access-old", refreshToken, accountId: "fixture-account", expiresAt: new Date(Date.now() + 3600000).toISOString(), ...extra }, preserveUnspecifiedSecrets: false });
     assert.equal(response.status, 200, await response.clone().text());
-    return { key, owner, projection: (await response.json()).grant, state: async () => (await owner.fetch("https://fixture/fixture/state")).json() };
+    return { key, owner, refreshToken, projection: (await response.json()).grant, state: async () => (await owner.fetch("https://fixture/fixture/state")).json() };
   }
   const runtime = async key => (await (await post(authority, "/grant-pools/states", { keys: [key] })).json()).states[key];
   return { mf, kv, authority, post, configure, calls, grant, runtime };
@@ -104,12 +110,13 @@ for (const requestFormat of ["form", "json"]) test(`workerd ${requestFormat} ref
     const response = await f.post(g.owner, "/materialize", input);
     const calls = await noReplay(f);
     const sent = requestFormat === "json" ? JSON.parse(calls[0].body) : Object.fromEntries(new URLSearchParams(calls[0].body));
-    assert.equal(sent.refresh_token, "fixture-refresh-old"); assert.equal(sent.client_secret, "fixture-client-secret");
+    assert.equal(sent.refresh_token, g.refreshToken); assert.equal(sent.client_secret, "fixture-client-secret");
     assert.equal(response.status, 502); assert.equal((await response.json()).error.code, "grant_refresh_failed");
     const { record, alarm } = await g.state();
     assert.equal(record.status, "active"); assert.equal(record.enabled, true); assert.equal(record.revokedAt, null);
+    assert.equal(record.refreshDiagnosis.failure.failureClass, "transient"); assert.equal(record.refreshDiagnosis.failure.httpStatus, config.status);
     assert.equal(record.generation, g.projection.credentialGeneration); assert.equal(record.lineage, g.projection.credentialLineage);
-    assert.equal(record.accessToken, "fixture-access-old"); assert.equal(record.refreshToken, "fixture-refresh-old");
+    assert.equal(record.accessToken, "fixture-access-old"); assert.equal(record.refreshToken, g.refreshToken);
     assert.ok(Date.parse(record.nextRefreshAttemptAt) > Date.now() + 290000); assert.ok(alarm > Date.now());
     assert.equal(await f.runtime(g.key), undefined, "redirect is not authentication/rate-limit feedback");
     const retry = await f.post(g.owner, "/materialize", input);
@@ -192,4 +199,17 @@ test("workerd OAuth exchange redirects cannot replay code, verifier or client se
     const projection = await f.kv.get(grantKey, "json"); assert.equal(projection.credentialStatus, "active"); assert.equal(projection.hasAccessToken, true); assert.equal(projection.hasRefreshToken, true);
     assert.equal(projection.accessToken, undefined); assert.equal(projection.refreshToken, undefined);
   });
+});
+
+test("workerd quota recovery refuses redirects on the post-refresh probe too", { timeout: 60_000 }, async t => {
+  const f = await fixture(t), g = await f.grant("openai");
+  await f.configure({}); assert.equal((await f.post(g.owner, "/quota-refresh", { key: g.key })).status, 200);
+  const before = await f.runtime(g.key);
+  await f.configure({ recoverThenRedirect: true });
+  const response = await f.post(g.owner, "/quota-refresh", { key: g.key });
+  assert.equal(response.status, 502); assert.equal((await response.json()).error.code, "grant_quota_probe_failed");
+  const calls = await noReplay(f, 3);
+  assert.equal(calls[2].headers.authorization, "Bearer fixture-access-new");
+  assert.deepEqual(await f.runtime(g.key), before, "redirect cannot replace the previous quota reading");
+  assert.equal((await g.state()).record.accessToken, "fixture-access-new", "successful rotation stays settled");
 });

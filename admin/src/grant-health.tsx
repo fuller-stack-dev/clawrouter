@@ -6,7 +6,7 @@ export function degradedPools(policies: AccessPolicy[], grants: UpstreamGrant[])
     const pool = policyGrants(policy, grants).filter(grant => !grant.revokedAt);
     return [...new Set(pool.map(grant => grant.provider))].flatMap(provider => {
       const members = pool.filter(grant => grant.provider === provider);
-      const reauth = members.filter(grant => grant.credentialStatus === "reauth_required");
+      const reauth = members.filter(grant => grant.credentialStatus === "reauth_required" || refreshAtRisk(grant));
       const models = policy.models?.filter(model => model.startsWith(`${provider}/`));
       // Evaluate actual policy models when restricted; otherwise include each
       // observed family, so scoped exhaustion is not hidden by another family.
@@ -21,15 +21,17 @@ export function degradedPools(policies: AccessPolicy[], grants: UpstreamGrant[])
 
 export function GrantRefreshHealth({ grant }: { grant: UpstreamGrant }) {
   const diagnosis = grant.refreshDiagnosis;
-  if (!diagnosis && grant.credentialStatus !== "reauth_required") return null;
+  if (!diagnosis && grant.credentialStatus !== "reauth_required" && !grant.hasRefreshToken) return null;
   const failure = diagnosis?.failure;
-  return <p>
-    {grant.credentialStatus === "reauth_required" ? "Reauth required" : failure ? "Refresh delayed" : "Refresh healthy"}
+  return <div aria-label="Refresh ownership and health">
+    {grant.hasRefreshToken ? <p>Login provenance: {grant.credentialProvenance === "clawrouter_oauth" ? "Minted by ClawRouter OAuth" : "Imported"}.
+      {grant.credentialProvenance !== "clawrouter_oauth" ? " Imported refreshable tokens may also be refreshed by another program. Use a fresh dedicated login; never copy an active Claude Code login." : " ClawRouter owns refresh for this dedicated login."}</p> : null}
+    <p>{refreshAtRisk(grant) ? "Refresh at risk — automatic replay stopped" : grant.credentialStatus === "reauth_required" ? "Reauth required" : failure ? "Refresh delayed" : "Refresh healthy"}
     {failure ? <> — {failure.oauthError} at <time dateTime={failure.lastFailureAt}>{new Date(failure.lastFailureAt).toLocaleString()}</time> · {failure.failureClass}{failure.httpStatus ? ` (HTTP ${failure.httpStatus})` : ""} · {failure.attemptCount} attempt(s)</> : null}
     {" · Last good refresh: "}{diagnosis?.lastSuccessfulRefreshAt ? <time dateTime={diagnosis.lastSuccessfulRefreshAt}>{new Date(diagnosis.lastSuccessfulRefreshAt).toLocaleString()}</time> : "Unknown"}
     {failure?.nextRetryAt ? <> · Next retry: <time dateTime={failure.nextRetryAt}>{new Date(failure.nextRetryAt).toLocaleString()}</time></> : null}
-    {grant.credentialStatus === "reauth_required" ? " · Replace with credentials from a fresh dedicated login in Access. Renaming or enabling this grant does not reauthorize it." : null}
-  </p>;
+    {grant.credentialStatus === "reauth_required" || refreshAtRisk(grant) ? " · Replace with credentials from a fresh dedicated login in Access. Renaming or enabling this grant does not reauthorize it." : null}
+  </p></div>;
 }
 
 export function GrantPoolIncidents({ policies, grants, ready, error, onOpenGrant }: {
@@ -46,4 +48,8 @@ export function GrantPoolIncidents({ policies, grants, ready, error, onOpenGrant
       {incident.reauth.map(grant => <div key={grant.key}><button type="button" className="buttonSecondary" onClick={() => onOpenGrant(grant)}>Repair {grant.label || grant.tokenRef}</button><GrantRefreshHealth grant={grant} /></div>)}
     </article>)}
   </section>;
+}
+
+function refreshAtRisk(grant: UpstreamGrant): boolean {
+  return ["ambiguous", "provider_ok_persist_failed"].includes(grant.refreshDiagnosis?.failure?.failureClass ?? "");
 }

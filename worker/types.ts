@@ -265,6 +265,10 @@ export interface UpstreamGrant {
   credentialGeneration?: number;
   credentialLineage?: string;
   credentialStatus?: "active" | "reauth_required";
+  // False: refresh ready; null: uncertain outcome; timestamp: retry floor.
+  // Explicit false clears a stale block when an owner overlays KV metadata.
+  credentialRefreshBlockedUntil?: string | null | false;
+  credentialProvenance?: "clawrouter_oauth" | "imported" | null;
   refreshDiagnosis?: import("../shared/contracts").GrantRefreshDiagnosis | null;
   hasCredential?: boolean;
   credentialFields?: string[];
