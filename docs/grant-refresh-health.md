@@ -9,8 +9,11 @@ skip probes requiring a refresh token; disabled/revoked grants cannot probe.
 
 Only the existing permanent refresh classifier (`400`/`401` plus
 `invalid_grant`, `invalid_token`, or `refresh_token_reused`) requires reauthorization.
-Other refresh failures retain the existing five-minute retry window. This change
-does not add backoff, jitter, refresh-family deduplication, or session-expiry logic.
+Safe transient failures use jittered exponential backoff and honor Retry-After.
+Ambiguous sends and provider-success/persistence-failure outcomes are fenced
+against replay. See [refresh ownership and settlement](refresh-ownership.md)
+for exact-generation settlement, duplicate-token custody and retry semantics.
+Session-expiry tracking is separate.
 
 ## Admin diagnosis
 
@@ -24,14 +27,17 @@ Admin grant responses include optional `refreshDiagnosis`:
   unknown. Import time and last selection are not successful refreshes.
 - `failure`: current consecutive failure episode, or `null` after successful
   refresh/replacement. Includes allowlisted `oauthError`, nullable `httpStatus`,
-  `failureClass` (`permanent`/`transient`), `firstFailureAt`, `lastFailureAt`,
+  `failureClass` (`permanent`, `retry_after`, `transient`, `ambiguous`, or
+  `provider_ok_persist_failed`), `firstFailureAt`, `lastFailureAt`,
   `attemptCount`, and nullable `nextRetryAt`.
 
 Unknown provider error strings become `unknown_error`; raw bodies, descriptions,
 request credentials, token fragments and hashes are never diagnosis fields.
 The failure episode is stored with credential state, survives owner restart, and
 is not cleared by renaming or enabling a grant. Credential replacement clears
-the episode; successful rotation also records its success timestamp.
+the episode when it supplies fresh refresh authority; resubmitting the same
+at-risk token does not clear its fence. Successful rotation also records its
+success timestamp.
 
 Subscriptions and the Access grant inspector show diagnosis and recovery guidance.
 The administrator dashboard independently reports degraded policy/provider pools:

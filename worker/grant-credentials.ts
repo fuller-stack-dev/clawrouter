@@ -1,9 +1,12 @@
-import { normalizedScopes, validTimestamp, envValue, boundedSecret, optionalSecret, boundedRefreshJson, boundedResponseJson, MAX_REFRESH_RESPONSE_BYTES, permanentRefreshFailure, safeOAuthError } from "./grant-refresh-diagnosis.ts";
+import { credentialProjection, hasFreshPrimaryCredentials, type CredentialRecord, type CredentialProjection, type OwnerResponse, type MaterializeRequest, type PutRequest } from "./grant-credential-record.ts";
+export type { CredentialProjection } from "./grant-credential-record.ts";
+import { claimRefreshOwnership, reserveRefreshOwnership, OWNERSHIP_CLAIM, OWNERSHIP_CURRENT } from "./refresh-ownership.ts";
+import { normalizedScopes, validTimestamp, envValue, boundedSecret, optionalSecret, boundedRefreshJson, boundedResponseJson, MAX_REFRESH_RESPONSE_BYTES, permanentRefreshFailure, safeOAuthError, refreshRetryAt } from "./grant-refresh-diagnosis.ts";
 import { routingProjection } from "./grant-projection.ts";
 import snapshotJson from "./generated/provider-snapshot.json" with { type: "json" };
 import { authorityCall, type GrantAttachmentResult, type GrantAttachmentSnapshot, type GrantAttachmentStatus } from "./authority.ts";
 import { grantCoolingDown, grantQuotaExhausted, grantQuotaRatio, observeGrantQuota, observeGrantQuotaProbe, quotaRuntime } from "./grant-quota.ts";
-import { grantUsable } from "./grant-selection.ts";
+import { grantUsable, REFRESH_MARGIN_MS } from "./grant-selection.ts";
 import { applyProviderCredential, applyTransportHeaders, quotaProbeForGrant, quotaProbesForGrant, requiredGrantTemplate, transformTransportBody, transportForGrant } from "./provider-auth.ts";
 import type { CompiledGrantTransport, CompiledProvider, Env, GrantRuntimeState, ProviderSnapshot, RefreshConfig, UpstreamGrant } from "./types";
 import { errorResponse, HttpError, json, readJson } from "./utils.ts";
@@ -11,90 +14,17 @@ import { applyTemplateHeaders, resolveTemplate } from "./provider-templates.ts";
 import type { ResponseControlDispatch } from "./responses-control-dispatch.ts";
 import { HttpOperation } from "./http-operation.ts";
 
-const REFRESH_MARGIN_MS = 5 * 60_000;
 const MAX_LEGACY_GRANT_BYTES = 3 * 1024 * 1024;
 const MIN_ALARM_DELAY_MS = 1_000;
 const MAX_MAINTENANCE_FAILURES = 6;
 const snapshot = snapshotJson as unknown as ProviderSnapshot;
 
-interface CredentialRecord {
-  version: 1;
-  generation: number;
-  lineage?: string;
-  enabled?: boolean;
-  status: "active" | "reauth_required";
-  refreshDiagnosis?: UpstreamGrant["refreshDiagnosis"];
-  credential?: string | null;
-  credentials?: Record<string, string>;
-  accessToken?: string | null;
-  refreshToken?: string | null;
-  tokenType?: string;
-  expiresAt?: string | null;
-  scopes?: string[];
-  accountId?: string | null;
-  subscription?: { plan?: string | null; subject?: string | null } | null;
-  refresh?: UpstreamGrant["refresh"];
-  createdAt?: string | null;
-  updatedAt: string;
-  grantKey?: string;
-  providerId?: string | null;
-  kind?: UpstreamGrant["kind"];
-  maintenance?: { keepWarm: boolean };
-  nextQuotaProbeAt?: string | null;
-  nextKeepWarmAt?: string | null;
-  nextRefreshAttemptAt?: string | null;
-  quotaFailureCount?: number;
-  quotaRetryAt?: Record<string, string>;
-  revokedAt?: string | null;
-  poolSyncPending?: boolean;
-  poolAdmissionRevision?: number;
-  metadata?: UpstreamGrant;
-}
-
-export interface CredentialProjection {
-  credentialStore: "durable_object";
-  credentialGeneration: number;
-  credentialLineage?: string;
-  credentialStatus: "active" | "reauth_required";
-  refreshDiagnosis: UpstreamGrant["refreshDiagnosis"];
-  hasCredential: boolean;
-  credentialFields: string[];
-  hasAccessToken: boolean;
-  hasRefreshToken: boolean;
-  tokenType?: string;
-  expiresAt?: string | null;
-  scopes?: string[];
-  accountId?: string | null;
-  subscription?: { plan?: string | null; subject?: string | null } | null;
-  refresh?: UpstreamGrant["refresh"];
-  createdAt?: string | null;
-  updatedAt: string;
-}
-
-interface OwnerResponse {
-  grant: UpstreamGrant;
-}
-
-interface MaterializeRequest {
-  key: string;
-  grant: UpstreamGrant;
-  legacy?: UpstreamGrant | null;
-  providerId: string;
-  refresh?: RefreshConfig | null;
-  force: boolean;
-  expectedGeneration?: number | null;
-}
-
-interface PutRequest {
-  key: string;
-  grant: UpstreamGrant;
-  preserveUnspecifiedSecrets: boolean;
-  // Contribution imports also replace secrets; only the explicit administrator
-  // operation may discard corrupt legacy metadata.
-  intent?: "replace";
-}
-
 export type GrantRevokeMetadata = Pick<UpstreamGrant, "kind" | "provider" | "label">;
+
+class SupersededRefresh extends Error {
+  readonly current: CredentialRecord;
+  constructor(current: CredentialRecord) { super("refresh generation superseded"); this.current = current; }
+}
 
 class ReauthorizationRequired extends HttpError {
   projection: CredentialProjection;
@@ -116,6 +46,9 @@ export class GrantCredentialObject implements DurableObject {
   }
 
   fetch(request: Request): Promise<Response> {
+    if (request.method === "POST" && new URL(request.url).pathname === OWNERSHIP_CURRENT) {
+      return this.state.storage.get<CredentialRecord>("credential").then(record => json({ exists: !!record, refreshToken: record?.refreshToken ?? null }));
+    }
     if (request.method === "POST" && new URL(request.url).pathname === "/responses/control") {
       const operation = this.tail.then(async () => {
         let preparation = new HttpOperation(request.signal, 10_000);
@@ -157,12 +90,16 @@ export class GrantCredentialObject implements DurableObject {
     }
     const operation = this.tail.then(() => this.handle(request));
     this.tail = operation.then(() => undefined, () => undefined);
+    // Rotation settlement belongs to the DO, not the observing HTTP caller.
+    this.state.waitUntil?.(this.tail);
     return operation;
   }
 
   alarm(): Promise<void> {
     const operation = this.tail.then(() => this.maintain());
     this.tail = operation.then(() => undefined, () => undefined);
+    // Rotation settlement belongs to the DO, not the observing HTTP caller.
+    this.state.waitUntil?.(this.tail);
     return operation;
   }
 
@@ -170,6 +107,7 @@ export class GrantCredentialObject implements DurableObject {
     const path = new URL(request.url).pathname;
     if (request.method !== "POST") return errorResponse("route_not_found", "route not found", 404);
     try {
+      if (path === OWNERSHIP_CLAIM) return await reserveRefreshOwnership(this.state.storage, this.env, request);
       if (path === "/put") {
         const input = await readJson<PutRequest>(request);
         const replace = input.intent === "replace";
@@ -201,6 +139,17 @@ export class GrantCredentialObject implements DurableObject {
           ? updatedCredentialRecord(current, input.grant)
           : credentialRecord(input.grant, generation);
         record = ownerMetadata(record, input.grant, input.key);
+        if (record.refreshToken) await claimRefreshOwnership(this.env, input.key, record.refreshToken, { current: current?.refreshToken === record.refreshToken && (!current.refreshAttempt || input.grant.refreshToken === undefined) });
+        const freshAuthority = !current || record.refreshToken !== current.refreshToken;
+        record.credentialProvenance = freshAuthority ? input.provenance ?? "imported" : current?.credentialProvenance ?? "imported";
+        // Access-only/metadata edits and same-token replacement cannot erase
+        // the refresh authority's fence, rejection, diagnosis or retry floor.
+        // Removing only refresh authority is not a fresh access credential.
+        const retainsFailedAccess = current && (current.refreshAttempt || current.status === "reauth_required") && !record.refreshToken && !hasFreshPrimaryCredentials(current, record);
+        if (current && (record.refreshToken && !freshAuthority || retainsFailedAccess)) {
+          record.status = current.status; record.refreshAttempt = current.refreshAttempt;
+          record.refreshDiagnosis = current.refreshDiagnosis; record.nextRefreshAttemptAt = current.nextRefreshAttemptAt;
+        }
         const grant = metadataGrant(record);
         // Admission reserves capacity without removing the old attachment. A
         // failed store leaves indexed pending work for this owner to reconcile.
@@ -214,8 +163,13 @@ export class GrantCredentialObject implements DurableObject {
         return json({ grant });
       }
       if (path === "/inspect") {
-        const record = await this.state.storage.get<CredentialRecord>("credential");
+        let record = await this.state.storage.get<CredentialRecord>("credential");
         if (!record) throw new HttpError(404, "grant_credential_missing", "upstream grant credential is not registered");
+        record = await this.diagnoseUnsettled(record);
+        if (canonicalRecord(record) && record.poolSyncPending) {
+          // A derived-index outage must not conceal the owner's diagnosis.
+          try { await this.publishProjection(record); } catch { /* durable pending state retries later */ }
+        }
         return json({ grant: canonicalRecord(record) ? metadataGrant(record) : credentialProjection(record) });
       }
       if (path === "/materialize") return json(await this.materialize(await readJson<MaterializeRequest>(request)));
@@ -235,7 +189,7 @@ export class GrantCredentialObject implements DurableObject {
         } finally {
           await this.state.storage.put("credential", record);
           await this.schedule(record);
-          if (before !== JSON.stringify(credentialProjection(record))) await this.publishProjection(record);
+          if (record.poolSyncPending || before !== JSON.stringify(credentialProjection(record))) await this.publishProjection(record);
         }
       }
       if (path === "/reconcile") {
@@ -288,6 +242,7 @@ export class GrantCredentialObject implements DurableObject {
       if (metadata?.revokedAt) record = revokedRecord(input.key, metadata);
       else if (metadata && hasPrimaryCredential(metadata)) record = ownerMetadata(credentialRecord(metadata, 1), metadata, input.key);
       if (!record) throw new HttpError(404, "grant_credential_missing", "upstream grant credential is not registered");
+      if (record.refreshToken) await claimRefreshOwnership(this.env, input.key, record.refreshToken);
       await this.state.storage.put("credential", record);
       record = (await this.reconcileAttachment(input.key)).record!;
       migrated = true;
@@ -302,6 +257,7 @@ export class GrantCredentialObject implements DurableObject {
       if (record.providerId && record.providerId !== input.providerId || record.kind !== input.grant.kind) throw new HttpError(409, "upstream_grant_changed", "upstream grant changed; retry discovery before dispatch");
       if (record.status === "reauth_required") throw new ReauthorizationRequired("upstream grant requires reauthorization", credentialProjection(record));
 
+      if (record.refreshAttempt) throw new HttpError(502, "grant_refresh_at_risk", "refresh outcome is uncertain; replace with a fresh dedicated login, do not replay the stored token");
       const expected = input.expectedGeneration;
       const mayForce = input.force && (expected != null ? expected === record.generation : migrated || !input.legacy);
       const expiresAtMs = record.expiresAt ? Date.parse(record.expiresAt) : NaN;
@@ -316,6 +272,8 @@ export class GrantCredentialObject implements DurableObject {
           try {
             record = await this.refresh(record, input.providerId, input.refresh ?? null);
             changed = true;
+            assertCredentialEnabled(record);
+            if (record.status === "reauth_required") throw new ReauthorizationRequired("upstream grant requires reauthorization", credentialProjection(record));
           } catch (error) {
             record = await this.state.storage.get<CredentialRecord>("credential") ?? record;
             changed = true;
@@ -331,12 +289,28 @@ export class GrantCredentialObject implements DurableObject {
     } finally {
       // KV permits one write per key per second. Publish the final owner state
       // once, including failed refreshes and stale disabled/revoked reads.
-      if (stale || changed || migrated) await this.publishProjection(record);
+      if (stale || changed || migrated || record.poolSyncPending) await this.publishProjection(record);
     }
   }
 
   private async refresh(record: CredentialRecord, providerId: string, providerRefresh: RefreshConfig | null): Promise<CredentialRecord> {
+    try { return await this.performRefresh(record, providerId, providerRefresh); }
+    catch (error) { if (error instanceof SupersededRefresh) return error.current; throw error; }
+  }
+
+  private async performRefresh(record: CredentialRecord, providerId: string, providerRefresh: RefreshConfig | null): Promise<CredentialRecord> {
     assertCredentialEnabled(record);
+    // Re-read authority before every attempt; a pending marker after restart is
+    // an ambiguous send, never permission to replay the old refresh token.
+    const current = await this.state.storage.get<CredentialRecord>("credential");
+    if (!current || current.generation !== record.generation) return current ?? record;
+    if (current.refreshAttempt) {
+      if (!current.refreshDiagnosis?.failure || !["ambiguous", "provider_ok_persist_failed"].includes(current.refreshDiagnosis.failure.failureClass)) {
+        await this.recordRefreshFailure(current, null, "outcome_unknown", "ambiguous");
+      }
+      throw new HttpError(502, "grant_refresh_at_risk", "refresh outcome is uncertain; replace with a fresh dedicated login, do not replay the stored token");
+    }
+    if (timestamp(current.nextRefreshAttemptAt) > Date.now()) throw new HttpError(502, "grant_refresh_failed", "refresh is waiting for its retry window");
     const config = record.refresh ?? providerRefresh;
     if (!config?.tokenUrl) {
       await this.recordRefreshFailure(record, null, "invalid_client");
@@ -355,6 +329,10 @@ export class GrantCredentialObject implements DurableObject {
     }
     for (const [name, value] of Object.entries(config.extraParams ?? {})) form.set(name, value);
 
+    if (record.grantKey && record.refreshToken) await claimRefreshOwnership(this.env, record.grantKey, record.refreshToken, { current: true, consume: true });
+    record = { ...record, refreshAttempt: { id: crypto.randomUUID(), generation: record.generation } };
+    // Durable before egress. A crash or an unpersistable result leaves a fence.
+    await this.state.storage.put("credential", record);
     const requestFormat = config.requestFormat ?? "form";
     let response: Response;
     try {
@@ -366,23 +344,24 @@ export class GrantCredentialObject implements DurableObject {
         redirect: "manual",
       });
     } catch {
-      await this.recordRefreshFailure(record, null, "network_error");
+      await this.recordRefreshFailure(record, null, "network_error", "ambiguous");
       throw new HttpError(502, "grant_refresh_failed", `provider ${providerId} rejected the refresh request`);
     }
     // A redirect is a transient endpoint failure, never evidence of token revocation.
     if (response.status >= 300 && response.status < 400) {
       await response.body?.cancel().catch(() => undefined);
+      await this.recordRefreshFailure(record, response.status, "invalid_response", "transient", response.headers.get("retry-after"));
       throw new HttpError(502, "grant_refresh_failed", `provider ${providerId} rejected the refresh request`);
     }
     let payload: Record<string, unknown>;
     try { payload = await boundedRefreshJson(response); }
     catch (error) {
-      await this.recordRefreshFailure(record, response.status, "invalid_response");
+      await this.recordRefreshFailure(record, response.status, "invalid_response", response.ok ? "ambiguous" : undefined, response.headers.get("retry-after"));
       if (error instanceof HttpError) throw error;
       throw new HttpError(502, "grant_refresh_failed", `provider ${providerId} returned an invalid refresh response`);
     }
     if (!response.ok || typeof payload.access_token !== "string" || !payload.access_token) {
-      const rejected = await this.recordRefreshFailure(record, response.status, payload.error ?? "invalid_response");
+      const rejected = await this.recordRefreshFailure(record, response.status, payload.error ?? "invalid_response", response.ok ? "ambiguous" : undefined, response.headers.get("retry-after"));
       if (rejected.status === "reauth_required") {
         throw new ReauthorizationRequired(`provider ${providerId} requires grant reauthorization`, credentialProjection(rejected));
       }
@@ -393,6 +372,7 @@ export class GrantCredentialObject implements DurableObject {
     try { updated = {
       ...record,
       status: "active",
+      refreshAttempt: null,
       generation: record.generation + 1,
       poolSyncPending: true,
       accessToken: boundedSecret(payload.access_token, "access token"),
@@ -408,10 +388,18 @@ export class GrantCredentialObject implements DurableObject {
       refreshDiagnosis: { lastSuccessfulRefreshAt: new Date().toISOString(), failure: null },
       updatedAt: new Date().toISOString(),
     }; } catch {
-      await this.recordRefreshFailure(record, response.status, "invalid_response");
+      await this.recordRefreshFailure(record, response.status, "invalid_response", response.ok ? "ambiguous" : undefined, response.headers.get("retry-after"));
       throw new HttpError(502, "grant_refresh_failed", `provider ${providerId} returned an invalid refresh response`);
     }
-    await this.state.storage.put("credential", updated);
+    try {
+      if (updated.grantKey && updated.refreshToken) await claimRefreshOwnership(this.env, updated.grantKey, updated.refreshToken, { current: updated.refreshToken === record.refreshToken });
+      const latest = await this.state.storage.get<CredentialRecord>("credential");
+      if (!sameRefreshAttempt(latest, record)) return latest ?? record;
+      await this.state.storage.put("credential", updated);
+    } catch {
+      await this.recordRefreshFailure(record, response.status, "persistence_failed", "provider_ok_persist_failed");
+      throw new HttpError(502, "grant_refresh_persist_failed", "provider refreshed credentials but durable settlement failed; a fresh dedicated login may be required");
+    }
     return updated;
   }
 
@@ -423,7 +411,7 @@ export class GrantCredentialObject implements DurableObject {
     record = await this.loadRecord(record.grantKey ?? "", record) ?? record;
     if (!record.enabled || !record.grantKey || !record.providerId || !record.kind || record.status === "reauth_required") {
       await this.state.storage.deleteAlarm();
-      if (record !== previous) await this.publishProjection(record);
+      if (record !== previous || record.poolSyncPending) await this.publishProjection(record);
       return;
     }
     const provider = snapshot.providers.find((candidate) => candidate.id === record!.providerId);
@@ -433,7 +421,7 @@ export class GrantCredentialObject implements DurableObject {
     const quotaProbe = quotaProbeForGrant(provider, materializedGrant({ provider: provider.id, kind: record.kind }, record));
     if (!quotaProbe) record.nextQuotaProbeAt = null;
     const refreshAt = record.nextRefreshAttemptAt ? Date.parse(record.nextRefreshAttemptAt) : record.expiresAt ? Date.parse(record.expiresAt) - REFRESH_MARGIN_MS : NaN;
-    if (record.refreshToken && Number.isFinite(refreshAt) && refreshAt <= now) {
+    if (record.refreshToken && !record.refreshAttempt && Number.isFinite(refreshAt) && refreshAt <= now) {
       try { record = { ...await this.refresh(record, provider.id, provider.auth.refresh), nextRefreshAttemptAt: null }; }
       catch {
         record = await this.state.storage.get<CredentialRecord>("credential") ?? record;
@@ -469,7 +457,7 @@ export class GrantCredentialObject implements DurableObject {
     }
     await this.state.storage.put("credential", record);
     await this.schedule(record);
-    if (before !== JSON.stringify(credentialProjection(record))) await this.publishProjection(record);
+    if (record.poolSyncPending || before !== JSON.stringify(credentialProjection(record))) await this.publishProjection(record);
   }
 
   private async probeQuota(provider: CompiledProvider, record: CredentialRecord): Promise<GrantRuntimeState> {
@@ -496,35 +484,55 @@ export class GrantCredentialObject implements DurableObject {
     });
   }
 
+  private async diagnoseUnsettled(record: CredentialRecord): Promise<CredentialRecord> {
+    // Only reached inside the owner tail, after any live refresh finished. A
+    // remaining pending marker means its result was not durably settled.
+    if (record.refreshAttempt && !["ambiguous", "provider_ok_persist_failed"].includes(record.refreshDiagnosis?.failure?.failureClass ?? "")) {
+      return this.recordRefreshFailure(record, null, "outcome_unknown", "ambiguous");
+    }
+    // Older canonical owners already diagnosed the failure, but neither pool
+    // index knows the new availability field. Repair both once, before use.
+    if (!record.refreshRoutingPublished && canonicalRecord(record) && (record.refreshAttempt || record.nextRefreshAttemptAt)) {
+      record = { ...record, poolSyncPending: true };
+      await this.state.storage.put("credential", record);
+    }
+    return record;
+  }
+
   private async deferRefresh(record: CredentialRecord): Promise<void> {
-    // Preserve the existing delay even when rotation could not be persisted.
-    // Outcome/consumption recovery is separate; never turn a write failure into
-    // a one-second alarm replay of the previous refresh token.
-    if (!(timestamp(record.nextRefreshAttemptAt) > Date.now())) {
-      record.nextRefreshAttemptAt = new Date(Date.now() + REFRESH_MARGIN_MS).toISOString();
+    if (!record.refreshAttempt && !(timestamp(record.nextRefreshAttemptAt) > Date.now())) {
+      record.poolSyncPending = true;
+      record.nextRefreshAttemptAt = refreshRetryAt(record.refreshDiagnosis?.failure?.attemptCount ?? 1, record.expiresAt);
       if (record.refreshDiagnosis?.failure) record.refreshDiagnosis.failure.nextRetryAt = record.nextRefreshAttemptAt;
       await this.state.storage.put("credential", record);
     }
     await this.schedule(record);
   }
 
-  private async recordRefreshFailure(record: CredentialRecord, status: number | null, code: unknown): Promise<CredentialRecord> {
+  private async recordRefreshFailure(record: CredentialRecord, status: number | null, code: unknown,
+    outcome?: NonNullable<NonNullable<UpstreamGrant["refreshDiagnosis"]>["failure"]>["failureClass"], retryAfter?: string | null): Promise<CredentialRecord> {
+    const current = await this.state.storage.get<CredentialRecord>("credential");
+    if (!current) throw new HttpError(409, "grant_credential_missing", "refresh owner no longer exists");
+    if (current.generation !== record.generation || record.refreshAttempt && !sameRefreshAttempt(current, record)) throw new SupersededRefresh(current);
     const permanent = status !== null && permanentRefreshFailure(status, code);
-    const now = new Date().toISOString();
-    const previous = record.refreshDiagnosis?.failure;
-    const nextRetryAt = permanent ? null : new Date(Date.now() + REFRESH_MARGIN_MS).toISOString();
+    const failureClass = outcome ?? (permanent ? "permanent" : status === 429 || retryAfter ? "retry_after" : "transient");
+    const atRisk = failureClass === "ambiguous" || failureClass === "provider_ok_persist_failed";
+    const now = new Date(Date.now()).toISOString();
+    const previous = current.refreshDiagnosis?.failure;
+    const attemptCount = Math.min(Number.MAX_SAFE_INTEGER, (previous?.attemptCount ?? 0) + 1);
+    const nextRetryAt = permanent || atRisk ? null : refreshRetryAt(attemptCount, current.expiresAt, retryAfter);
     const rejected: CredentialRecord = {
-      ...record,
-      status: permanent ? "reauth_required" : record.status,
-      generation: permanent ? record.generation + 1 : record.generation,
-      poolSyncPending: permanent || record.poolSyncPending,
-      updatedAt: permanent ? now : record.updatedAt,
+      ...current,
+      status: permanent ? "reauth_required" : current.status,
+      generation: permanent ? current.generation + 1 : current.generation,
+      refreshAttempt: atRisk ? current.refreshAttempt : null,
+      poolSyncPending: true,
+      updatedAt: permanent ? now : current.updatedAt,
       nextRefreshAttemptAt: nextRetryAt,
       refreshDiagnosis: {
-        lastSuccessfulRefreshAt: record.refreshDiagnosis?.lastSuccessfulRefreshAt ?? null,
-        failure: { oauthError: safeOAuthError(code), httpStatus: status, failureClass: permanent ? "permanent" : "transient",
-          firstFailureAt: previous?.firstFailureAt ?? now, lastFailureAt: now,
-          attemptCount: Math.min(Number.MAX_SAFE_INTEGER, (previous?.attemptCount ?? 0) + 1), nextRetryAt },
+        lastSuccessfulRefreshAt: current.refreshDiagnosis?.lastSuccessfulRefreshAt ?? null,
+        failure: { oauthError: safeOAuthError(code), httpStatus: status, failureClass,
+          firstFailureAt: previous?.firstFailureAt ?? now, lastFailureAt: now, attemptCount, nextRetryAt },
       },
     };
     await this.state.storage.put("credential", rejected);
@@ -534,11 +542,15 @@ export class GrantCredentialObject implements DurableObject {
 
   private async publishProjection(record: CredentialRecord): Promise<void> {
     if (!record.grantKey) return;
-    if (record.poolSyncPending) {
-      await this.reconcileAttachment(record.grantKey);
-      record.poolSyncPending = false;
-    }
+    if (record.poolSyncPending) await this.reconcileAttachment(record.grantKey);
     await this.env.POLICY_KV.put(record.grantKey, JSON.stringify(metadataGrant(record)));
+    // Authority ACK alone cannot retire publication: KV-backed selection must
+    // also see the outcome, including newly diagnosed abandoned attempts.
+    if (record.poolSyncPending || !record.refreshRoutingPublished) {
+      record.poolSyncPending = false;
+      record.refreshRoutingPublished = true;
+      await this.state.storage.put("credential", record);
+    }
   }
 
   private async reconcileAttachment(key: string): Promise<{ record: CredentialRecord | undefined; result: GrantAttachmentResult }> {
@@ -549,16 +561,12 @@ export class GrantCredentialObject implements DurableObject {
     const result = record
       ? await authorityCall<GrantAttachmentResult>(this.env, "/grant-pools/publish", { key, generation: record.generation, revision: indexed.revision, admissionRevision: record.poolAdmissionRevision, provider: record.providerId ?? null, status: attachmentStatus(record), projection: routingProjection(metadataGrant(record)) })
       : await authorityCall<GrantAttachmentResult>(this.env, "/grant-pools/cancel-pending", { key, revision: indexed.revision });
-    if (record?.poolSyncPending) {
-      record.poolSyncPending = false;
-      await this.state.storage.put("credential", record);
-    }
     return { record, result };
   }
 
   private async schedule(record: CredentialRecord): Promise<void> {
     const next = [
-      record.refreshToken && record.nextRefreshAttemptAt ? Date.parse(record.nextRefreshAttemptAt) : record.refreshToken && record.expiresAt ? Date.parse(record.expiresAt) - REFRESH_MARGIN_MS : NaN,
+      record.refreshAttempt ? NaN : record.refreshToken && record.nextRefreshAttemptAt ? Date.parse(record.nextRefreshAttemptAt) : record.refreshToken && record.expiresAt ? Date.parse(record.expiresAt) - REFRESH_MARGIN_MS : NaN,
       timestamp(record.nextQuotaProbeAt),
       record.maintenance?.keepWarm ? timestamp(record.nextKeepWarmAt) : NaN,
     ].filter(Number.isFinite);
@@ -572,6 +580,7 @@ export class GrantCredentialObject implements DurableObject {
   private async loadRecord(key: string, stored?: CredentialRecord, repair = true): Promise<CredentialRecord | undefined> {
     let record = stored ?? await this.state.storage.get<CredentialRecord>("credential");
     if (!record) return record;
+    record = await this.diagnoseUnsettled(record);
     if (canonicalRecord(record)) return repair && record.poolSyncPending ? (await this.reconcileAttachment(key)).record : record;
     if (!record.metadata || record.enabled === undefined) {
       const metadata = key ? await legacyGrantMetadata(this.env, key) : null;
@@ -636,7 +645,7 @@ function metadataGrant(record: CredentialRecord): UpstreamGrant {
 function attachmentStatus(record: CredentialRecord): GrantAttachmentStatus | null {
   if (record.revokedAt) return null;
   if (!record.enabled) return "paused";
-  return record.status === "reauth_required" || !grantUsable(metadataGrant(record)) ? "reauth_required" : "active";
+  return record.status === "reauth_required" || !hasPrimaryCredential(record) ? "reauth_required" : "active";
 }
 
 function revokedRecord(key: string, metadata: UpstreamGrant | null, generation = metadata?.credentialGeneration ?? 0): CredentialRecord {
@@ -685,7 +694,7 @@ async function probeQuota(env: Env, provider: CompiledProvider, record: Credenti
       grant = materializedGrant({ provider: provider.id, kind: record.kind, maintenance: record.maintenance }, record);
       applyProviderCredential(provider, grant, env, headers, url.searchParams);
       for (const [name, value] of Object.entries(probe.headers)) headers.set(name, requiredGrantTemplate(value, grant, "grant_quota_probe_unavailable"));
-      try { response = await fetch(url, { method: probe.method, headers, signal: AbortSignal.timeout(10_000) }); }
+      try { response = await fetch(url, { method: probe.method, headers, signal: AbortSignal.timeout(10_000), redirect: "manual" }); }
       catch { throw new HttpError(502, "grant_quota_probe_failed", `provider ${provider.id} quota probe failed`); }
     }
     if (response.status === 429) {
@@ -790,8 +799,8 @@ export async function inspectGrantCredentials(env: Env, key: string): Promise<Up
   return (await ownerCall<OwnerResponse>(env, key, "/inspect", {})).grant;
 }
 
-export async function putGrantCredentials(env: Env, key: string, grant: UpstreamGrant, preserveUnspecifiedSecrets = false, intent?: "replace"): Promise<UpstreamGrant> {
-  return (await ownerCall<OwnerResponse>(env, key, "/put", { key, grant, preserveUnspecifiedSecrets, intent })).grant;
+export async function putGrantCredentials(env: Env, key: string, grant: UpstreamGrant, preserveUnspecifiedSecrets = false, intent?: "replace", provenance?: "clawrouter_oauth"): Promise<UpstreamGrant> {
+  return (await ownerCall<OwnerResponse>(env, key, "/put", { key, grant, preserveUnspecifiedSecrets, intent, provenance })).grant;
 }
 
 export async function reconcileGrantAttachment(env: Env, key: string): Promise<GrantAttachmentResult> {
@@ -882,7 +891,7 @@ function updatedCredentialRecord(current: CredentialRecord | undefined, grant: U
     const value = updated[key as keyof CredentialRecord];
     return typeof value === "string" && value !== current[key as keyof CredentialRecord];
   }) || JSON.stringify(Object.entries(updated.credentials ?? {}).sort()) !== JSON.stringify(Object.entries(current.credentials ?? {}).sort());
-  if (replaced) { updated.status = "active"; updated.refreshDiagnosis = null; updated.nextRefreshAttemptAt = null; }
+  if (replaced && (!current.refreshAttempt || updated.refreshToken !== current.refreshToken || !updated.refreshToken && hasFreshPrimaryCredentials(current, updated))) { updated.status = "active"; updated.refreshDiagnosis = null; updated.refreshAttempt = null; updated.nextRefreshAttemptAt = null; }
   // Explicit credential/account replacement is not a refresh, even when the
   // operator keeps the same account label. Refresh-token replacement also can
   // change the next upstream account, so it invalidates continuation ownership.
@@ -894,27 +903,6 @@ function updatedCredentialRecord(current: CredentialRecord | undefined, grant: U
   return updated;
 }
 
-function credentialProjection(record: CredentialRecord): CredentialProjection {
-  return {
-    credentialStore: "durable_object",
-    credentialGeneration: record.generation,
-    credentialLineage: record.lineage,
-    credentialStatus: record.status,
-    refreshDiagnosis: record.refreshDiagnosis ?? null,
-    hasCredential: !!record.credential || Object.keys(record.credentials ?? {}).length > 0,
-    credentialFields: Object.keys(record.credentials ?? {}).sort(),
-    hasAccessToken: !!record.accessToken,
-    hasRefreshToken: !!record.refreshToken,
-    tokenType: record.tokenType,
-    expiresAt: record.expiresAt,
-    scopes: record.scopes,
-    accountId: record.accountId,
-    subscription: record.subscription,
-    refresh: record.refresh,
-    createdAt: record.createdAt,
-    updatedAt: record.updatedAt,
-  };
-}
 
 function materializedGrant(metadata: UpstreamGrant, record: CredentialRecord): UpstreamGrant {
   return {
@@ -1001,4 +989,8 @@ function normalizedCredentials(value: Record<string, string>): Record<string, st
     if (!/^[A-Za-z0-9_.-]{1,128}$/.test(name)) throw new HttpError(400, "invalid_upstream_grant", "credential bundle contains an invalid field name");
     return [name, boundedSecret(secret, `credential ${name}`)];
   }));
+}
+
+function sameRefreshAttempt(current: CredentialRecord | undefined, attempted: CredentialRecord): boolean {
+  return !!current && current.generation === attempted.generation && current.refreshAttempt?.id === attempted.refreshAttempt?.id;
 }

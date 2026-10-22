@@ -13,8 +13,8 @@ export async function startWorkerdFixture(temporary, routerScript, upstreamScrip
 // preventEviction: local workerd runs every Durable Object on the router's thread;
 // idle eviction (~10s) closes SQLite synchronously and stalls the whole runtime.
 // Wall-clock cadence fixtures opt out; production objects are not co-scheduled.
-export async function startBundledWorkerdFixture(temporary, routerScript, upstreamScript, { persistencePath, upstreamDurableObjects, queueConsumer, preventEviction } = {}) {
-  const mf = new Miniflare(convertV4MiniflareOptions({ resourceTmpPath: temporary, ...(persistencePath ? { resourcePersistencePath: persistencePath } : {}), workers: [{
+export async function startBundledWorkerdFixture(temporary, routerScript, upstreamScript, { persistencePath, upstreamDurableObjects, queueConsumer, preventEviction, log } = {}) {
+  const mf = new Miniflare(convertV4MiniflareOptions({ ...(log ? { log } : {}), resourceTmpPath: temporary, ...(persistencePath ? { resourcePersistencePath: persistencePath } : {}), workers: [{
     name: "router", modules: true, script: routerScript, compatibilityDate: "2026-06-05", compatibilityFlags: ["enable_request_signal"],
     bindings: { OPENAI_API_KEY: "fixture-upstream-key" },
     kvNamespaces: ["POLICY_KV"],

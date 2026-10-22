@@ -1,7 +1,7 @@
 import { GrantCredentialObject } from "../grant-credentials.ts";
 import { createGrantAuthority } from "./grant-authority-fixture.mjs";
 
-export function attachGrantCredentialNamespace(env, { useExistingAuthority = false } = {}) {
+export function attachGrantCredentialNamespace(env, { useExistingAuthority = false, kvValues } = {}) {
   const objects = new Map();
   if (!useExistingAuthority) {
     const fallback = env.ACCESS_CONTROL;
@@ -12,6 +12,7 @@ export function attachGrantCredentialNamespace(env, { useExistingAuthority = fal
         ? env.grantAuthority.fetch(url, init) : fallback.get(id).fetch(url, init);
     } }) };
   }
+  env.POLICY_KV.list ??= async ({ prefix = "" } = {}) => ({ keys: [...(kvValues ?? objects).keys()].filter(name => name.startsWith(prefix)).map(name => ({ name })), list_complete: true });
   env.GRANT_CREDENTIALS = {
     objects,
     idFromName(name) { return name; },

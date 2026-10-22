@@ -1,3 +1,4 @@
+import { selectedCredentialFailure } from "./grant-credential-failure.ts";
 import { grantStickyInput } from "./grant-sticky.ts";
 import { modelForEndpoint } from "./model-pricing.ts";
 import snapshotJson from "./generated/provider-snapshot.json" with { type: "json" };
@@ -365,7 +366,10 @@ async function grantFor(provider: CompiledProvider, auth: AuthorizedIdentity, en
   const admitted = recordSelection && !pinned && requirement ? await admittedGrantSelection(auth, env, requirement, excludedKeys) : undefined;
   if (!admitted && excludedKeys.size && auth.authType === "proxy_key") stickyHash = await grantStickyInput(auth, proxySessionHash(auth));
   const resolution = admitted ?? await resolveGrantSelection(provider.id, auth.policyId, auth.policy.tenantId ?? "default", tokenRef, env, excludedKeys, auth.policy.grantRouting, stickyHash, recordSelection, pinned?.key, requirement, excludedKeys.size ? undefined : proxyAdmission(auth)?.pools[provider.id]);
-  return { selected: resolution.selected ? { key: resolution.selected.key, grant: await refreshGrant(resolution.selected.key, resolution.selected.grant, provider, env, false) } : null, hasConfiguredGrant: resolution.hasConfiguredGrant, retryAt: resolution.retryAt };
+  if (!resolution.selected) return { selected: null, hasConfiguredGrant: resolution.hasConfiguredGrant, retryAt: resolution.retryAt };
+  const { key, grant } = resolution.selected;
+  try { return { selected: { key, grant: await refreshGrant(key, grant, provider, env, false) }, hasConfiguredGrant: resolution.hasConfiguredGrant, retryAt: resolution.retryAt }; }
+  catch (error) { throw selectedCredentialFailure(error, key); }
 }
 
 export async function refreshStoredGrant(env: Env, key: string): Promise<UpstreamGrant> {

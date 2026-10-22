@@ -1,3 +1,4 @@
+import { SelectedGrantCredentialFailure } from "./grant-credential-failure.ts";
 import { softBudget } from "./soft-budget.ts";
 import { assertCompactAccount } from "./responses-compact.ts";
 import { assertServiceTier } from "./service-tiers.ts";
@@ -54,11 +55,13 @@ interface PreparedUpstream {
   connection: ProviderConnection;
   websocket: boolean;
   backgroundRecovery: boolean;
+  failedGrantKey?: string;
   continuation?: ContinuationOwner;
   revalidateCompactAccount?: () => Promise<void>;
 }
 
 interface ReservedProxyBudget {
+  failedGrantKey?: string;
   auth: AuthorizedIdentity;
   reservation: BudgetReservation;
   cost: EstimatedCost;
@@ -269,9 +272,11 @@ async function proxySelected(request: Request, env: Env, context: ExecutionConte
   let background: HttpBackground | undefined;
   let prepared: PreparedUpstream;
   let continuation: HttpContinuation | undefined;
+  let grantFailover = false;
   try {
     continuation = await HttpContinuation.resolve(request, selection, auth, env);
-    prepared = await prepareSelected(request, env, selection, queryInput, auth, new Set(), true, reservedBudget?.connection, continuation?.pinned, "http", true);
+    prepared = await prepareSelected(request, env, selection, queryInput, auth, new Set(reservedBudget?.failedGrantKey ? [reservedBudget.failedGrantKey] : []), true, reservedBudget?.connection, continuation?.pinned, "http", true);
+    grantFailover = !!(reservedBudget?.failedGrantKey || prepared.failedGrantKey);
     if (prepared.continuation) continuation?.bind(prepared.continuation);
     const cost = estimateCost(selection.model, selection.body, auth.policy.requestCostMicros, selection.capability, selection.endpoint, continuation?.parentTools);
     accounting = createProxyAccounting({ ...accountingContext, cost, grantKey: prepared.grantKey, grantLane: prepared.grantLane });
@@ -352,7 +357,6 @@ async function proxySelected(request: Request, env: Env, context: ExecutionConte
   }
   const discard = (response: Response) => { void response.body?.cancel(signal.reason).catch(() => undefined); };
   let response: Response | undefined;
-  let grantFailover = false;
   let dispatched = false;
   try {
     // A canceled preflight is known-unsent even if the ledger marks already landed.
@@ -367,7 +371,7 @@ async function proxySelected(request: Request, env: Env, context: ExecutionConte
     }
     response = await operation.wait(pending, "upstream", discard);
     captureGrantRuntime(context, env, prepared.grantKey, prepared.grantRevision, selection.provider.quota, response);
-    if (!background && !continuation?.requested && shouldFailoverGrant(response.status, selection.method, selection.capability, prepared.grantKey, grantRoutingPolicy(auth.policy.grantRouting).failover)) {
+    if (!grantFailover && !background && !continuation?.requested && shouldFailoverGrant(response.status, selection.method, selection.capability, prepared.grantKey, grantRoutingPolicy(auth.policy.grantRouting).failover)) {
       let retry: PreparedUpstream | undefined;
       try {
         retry = await operation.wait(prepareSelected(request, env, selection, queryInput, auth, new Set([prepared.grantKey!]), true, prepared.connection));
@@ -469,7 +473,7 @@ async function reserveSelected(request: Request, env: Env, context: ExecutionCon
   const { cost } = accounting;
   try {
     const reservation = await reserveBudget(env, auth, selection.capability, cost, prepared.connection);
-    return { auth, reservation, cost, providerId: selection.provider.id, modelId: selection.model?.id ?? null, capability: selection.capability, connection: prepared.connection };
+    return { auth, reservation, cost, failedGrantKey: prepared.failedGrantKey, providerId: selection.provider.id, modelId: selection.model?.id ?? null, capability: selection.capability, connection: prepared.connection };
   } catch (error) {
     const failure = error instanceof HttpError ? error : new HttpError(503, "budget_store_unavailable", "budget ledger is unavailable");
     accounting.fail(failure.status, failure.status === 402 ? "denied" : failure.status < 500 ? "client_error" : "provider_error");
@@ -488,6 +492,20 @@ async function selectedAuth(request: Request, env: Env, mode: AuthMode, selectio
 }
 
 export async function prepareSelected(request: Request, env: Env, selection: ProxySelection, queryInput: Record<string, unknown>, auth: AuthorizedIdentity, excludedGrantKeys: ReadonlySet<string> = new Set(), recordSelection = true, resolvedConnection?: ProviderConnection, pinned?: PinnedGrant, transport: "http" | "websocket" = "http", recoverBackground = false): Promise<PreparedUpstream> {
+  const prepare = (excluded: ReadonlySet<string>) => prepareSingleSelected(request, env, selection, queryInput, auth, excluded, recordSelection, resolvedConnection, pinned, transport, recoverBackground);
+  try { return await prepare(excludedGrantKeys); }
+  catch (error) {
+    const routing = grantRoutingPolicy(auth.policy.grantRouting);
+    if (!(error instanceof SelectedGrantCredentialFailure) || pinned || excludedGrantKeys.size || !routing.failover) throw error;
+    try {
+      const retry = await prepare(new Set([error.grantKey]));
+      if (!retry.grantKey && !grantRoutingPolicy(auth.policy.grantRouting).environmentFallback) throw error;
+      return { ...retry, failedGrantKey: error.grantKey };
+    } catch { throw error; } // No usable alternate: preserve the original credential failure.
+  }
+}
+
+async function prepareSingleSelected(request: Request, env: Env, selection: ProxySelection, queryInput: Record<string, unknown>, auth: AuthorizedIdentity, excludedGrantKeys: ReadonlySet<string> = new Set(), recordSelection = true, resolvedConnection?: ProviderConnection, pinned?: PinnedGrant, transport: "http" | "websocket" = "http", recoverBackground = false): Promise<PreparedUpstream> {
   assertPolicyModel(auth.policy, selection);
   assertServiceTier(auth, selection);
   if (selection.endpoint.request_format === "openai.images_generations" && (Object.keys(queryInput).length || new URL(request.url).search)) throw new HttpError(400, "invalid_image_generation", "image generation options must be in JSON, not query parameters");
