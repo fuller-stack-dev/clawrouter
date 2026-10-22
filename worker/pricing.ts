@@ -128,7 +128,7 @@ export function hostedToolPricingGap(tools: readonly unknown[], requestFormat: s
   return usageGap ? "hosted_tool_usage" : null;
 }
 
-export type PricingEndpoint = Pick<CompiledEndpoint, "request_format" | "outputTokenLimit">;
+export type PricingEndpoint = Pick<CompiledEndpoint, "request_format" | "outputTokenLimit"> & Partial<Pick<CompiledEndpoint, "id">>;
 
 export function estimateModelCost(pricing: ModelPricing, body: Record<string, unknown>, endpoint?: PricingEndpoint): CostEstimate {
   if (pricing.unit === "image_token") return estimateImageCost(pricing, body);
